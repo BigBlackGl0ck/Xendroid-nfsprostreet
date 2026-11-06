@@ -49,6 +49,17 @@ struct kPacketHandle {
   bool is_valid_ = false;
 };
 
+// Why Decode() stopped without a frame to output.
+enum class kDecodeStop {
+  kNone,
+  // The frame continues in the other input buffer, which isn't valid yet.
+  kWaitForBuffer,
+  // The frame failed to decode, or no frame starts at the position.
+  kParserError,
+};
+
+enum class kPacketResult { kFrame, kNoFrame, kError };
+
 // Where decoding goes once the frame being output is done.
 struct kPendingAdvance {
   bool pending_ = false;
@@ -75,6 +86,15 @@ class XmaContextNew : public XmaContext {
  public:
   static constexpr uint32_t kBitsPerPacketHeader = 32;
   static constexpr uint32_t kMaxFrameSizeinBits = 0x4000 - kBitsPerPacketHeader;
+
+  // DWORD2 error_status: why decoding last stopped.
+  static constexpr uint32_t kErrorOutputFull = 1;
+  static constexpr uint32_t kErrorOutputSpace = 2;
+  static constexpr uint32_t kErrorNoInput = 4;
+  static constexpr uint32_t kErrorWaitForBuffer = 8;
+  // DWORD3 parser_error_status, until a frame decodes.
+  static constexpr uint32_t kParserErrorBitstream = 3;
+  static constexpr uint32_t kParserErrorNoFrame = 4;
 
   explicit XmaContextNew();
   ~XmaContextNew();
@@ -141,8 +161,10 @@ class XmaContextNew : public XmaContext {
 
   RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
 
-  bool DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet,
-                    AVFrame* av_frame);
+  kPacketResult DecodePacket(AVCodecContext* av_context,
+                             const AVPacket* av_packet, AVFrame* av_frame);
+  static void SetError(XMA_CONTEXT_DATA* data, uint32_t status);
+  static void SetParserError(XMA_CONTEXT_DATA* data, uint32_t status);
 
   // Re-reads context from guest memory and merges only decoder-owned fields,
   // preserving any game modifications made during decoding.
@@ -167,6 +189,7 @@ class XmaContextNew : public XmaContext {
   bool loop_start_skip_pending_ = false;
 
   kPendingAdvance advance_;
+  kDecodeStop decode_stop_ = kDecodeStop::kNone;
   // The position WritePosition() left in the context.
   uint32_t held_offset_ = 0;
   uint32_t held_subframe_ = 0;
