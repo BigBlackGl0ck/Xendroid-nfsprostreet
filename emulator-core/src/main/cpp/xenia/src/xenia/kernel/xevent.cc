@@ -115,6 +115,11 @@ void XEvent::RecordSetter() {
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
   set_priority_increment(priority_increment);
   RecordSetter();
+  if (manual_reset_) {
+    // Releases every waiter parked right now, even if the event is reset
+    // before they run. Must precede the wake below.
+    pulse_epoch_.fetch_add(1);
+  }
   // KeSetEvent returns the signal state from before.
   int32_t old_signal_state;
   {
