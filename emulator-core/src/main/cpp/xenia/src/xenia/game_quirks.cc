@@ -247,6 +247,32 @@ static const Quirk kQuirks[] = {
      "4x depth-only shadow draws into the 1x surface of their samples"},
     {0x4D5308AB, "vulkan_samples_as_pixels_simple_ps", true,
      "4x draws with simple pixel shaders into the 1x surface"},
+    // Software round-toward-zero in vertex shaders (after 2026-10-05) pushed
+    // that same fountain checkpoint (~2520 draws, 65 passes, 6298 tiles a
+    // frame) back to 21.3-21.6 fps, 44.6-45.2 ms of GPU a frame with pass
+    // timestamps (1280x2048 scene pass 29.2-29.9 ms, 1120x2352 shadow pass
+    // 3.3-3.4 ms). Measured on the POCO F7 (Adreno 825, Turnip V38,
+    // 2026-11-18):
+    // - Without software RTZ: 31.3 ms (1280x2048 18.8 ms, 1120x2352 1.33 ms),
+    //   no exploding or z-fighting geometry in the scene.
+    // - Without SM3 zero-multiply emulation in vertex shaders (exact for finite
+    //   operands, so positions still match across passes): 40.8 ms (1280x2048
+    //   25.5 ms).
+    // - 2D fetches with the host's implicit LOD: 43.5 ms.
+    // - Texture loads straight into the image (exact, interleaved A/B):
+    //   45.2 -> 44.5 ms (misc 5.58 -> 4.65 ms).
+    // Together: 28.2 ms of GPU a frame (-37%, 1280x2048 15.3 ms, 1120x2352
+    // 1.01 ms), 29.3-30 fps even with pass timestamps on, the same sky,
+    // horizon, cobblestone ground and fountain. Memexport barriers by range,
+    // structured forward jumps and coarse 4x-as-1x were neutral here.
+    {0x4D5308AB, "alu_round_toward_zero", false,
+     "vertex math with the host's rounding"},
+    {0x4D5308AB, "spirv_vs_relaxed_math", int64_t(1),
+     "no SM3 zero-multiply emulation in vertex shaders"},
+    {0x4D5308AB, "spirv_texture_implicit_lod", true,
+     "2D texture fetches with the host's LOD"},
+    {0x4D5308AB, "vulkan_texture_load_to_image", true,
+     "texture loads straight into the image"},
     // Crysis 3 (CryENGINE 3) moves one 1350-tile depth surface between 1x and
     // 4x MSAA 47 times each way a frame on the deck of its first checkpoint:
     // 156 transfers (45100 tiles) and 211 render passes a frame, GPU-bound at

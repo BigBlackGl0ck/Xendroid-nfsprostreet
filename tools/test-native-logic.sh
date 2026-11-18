@@ -5,7 +5,8 @@
 # frame stats, the adaptive audio buffer, the audio drivers' block processing,
 # the XEX header and title update patch bounds, the names installed content
 # packages take, the socket option values, the XNet startup parameters, the shader
-# jumps translated as if and else and the barriers between exporting draws.
+# jumps translated as if and else, the barriers between exporting draws, and the
+# software RTZ ALU / EDRAM alias / centroid clamp helpers.
 # They need only a C++20 compiler.
 # With XENDROID_NDK, also host threads: APCs alerted at once to several threads,
 # and waits given the same handle twice.
@@ -28,7 +29,7 @@ else
     dl=(-ldl)   # dladdr/dl_iterate_phdr before glibc 2.34
 fi
 flags=(-std=c++20 -O1 -Wall -I "$cpp" -I "$cpp/xenia" -I "$cpp/xenia/src" -I "$test/stubs")
-for name in presentation_runtime_test pipeline_cache_file_test vblank_pacer_test changed_settings_test frame_stats_test audio_buffer_tuner_test audio_block_renderer_test xex_header_test fatx_package_name_test socket_option_test xnet_startup_test structured_jumps_test draw_export_tracker_test xam_live_signin_test; do
+for name in presentation_runtime_test pipeline_cache_file_test vblank_pacer_test changed_settings_test frame_stats_test audio_buffer_tuner_test audio_block_renderer_test xex_header_test fatx_package_name_test socket_option_test xnet_startup_test structured_jumps_test draw_export_tracker_test gpu_compat_perf_test xam_live_signin_test; do
     "${cxx[@]}" "${flags[@]}" "$test/$name.cc" -o "$build/$name"
 done
 # C01: the crash record is a source file of its own (signal-handler code).
@@ -47,9 +48,14 @@ done
 "$build/xnet_startup_test"
 "$build/structured_jumps_test"
 "$build/draw_export_tracker_test"
+"$build/gpu_compat_perf_test"
 "$build/xam_live_signin_test"
 "$build/crash_record_test" "$build/crash-record-scratch"
 "$build/string_key_test"
+"${cxx[@]}" "${flags[@]}" "$test/lote16_upstream_test.cc" \
+    "$cpp/xenia/src/xenia/base/string.cc" \
+    "$cpp/xenia/src/xenia/base/utf8.cc" -o "$build/lote16_upstream_test"
+"$build/lote16_upstream_test" "$cpp/xenia/src/xenia/cpu/backend/a64"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then

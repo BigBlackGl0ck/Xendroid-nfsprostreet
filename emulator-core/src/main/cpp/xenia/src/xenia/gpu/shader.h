@@ -921,17 +921,23 @@ class Shader {
 
   // Labels that jumps (explicit or from loops) can be done to.
   const std::set<uint32_t>& label_addresses() const { return label_addresses_; }
-  // Whether the result of the vector or the scalar operation of the ALU
-  // instruction at the address may reach a vertex fetch index, the address
-  // register, a memory export or a floor, trunc or frc operand, where rounding
-  // it differently may change the outcome by a whole unit. Vertex shaders only.
+  // Component mask (bits 0..3) of the vector operation or whether the scalar
+  // operation of the ALU instruction at the address may reach a vertex fetch
+  // index, the address register, a memory export or a floor, trunc or frc
+  // operand, where rounding it differently may change the outcome by a whole
+  // unit. Vertex shaders only.
+  uint32_t GetAluVectorResultRoundingSensitiveComponents(
+      uint32_t address) const {
+    return address < alu_rounding_sensitive_results_.size()
+               ? (alu_rounding_sensitive_results_[address] & 0b1111u)
+               : 0u;
+  }
   bool IsAluVectorResultRoundingSensitive(uint32_t address) const {
-    return address < alu_rounding_sensitive_results_.size() &&
-           (alu_rounding_sensitive_results_[address] & 0b01);
+    return GetAluVectorResultRoundingSensitiveComponents(address) != 0;
   }
   bool IsAluScalarResultRoundingSensitive(uint32_t address) const {
     return address < alu_rounding_sensitive_results_.size() &&
-           (alu_rounding_sensitive_results_[address] & 0b10);
+           (alu_rounding_sensitive_results_[address] & 0b10000u);
   }
 
   // Exclusive upper bound of the indexes of paired control flow instructions
@@ -1095,8 +1101,9 @@ class Shader {
   std::vector<TextureBinding> texture_bindings_;
   ConstantRegisterMap constant_register_map_ = {0};
   std::set<uint32_t> label_addresses_;
-  // Per instruction address, bit 0 for the vector and bit 1 for the scalar
-  // operation (see IsAluVectorResultRoundingSensitive).
+  // Per instruction address, bits 0..3 for the vector result components and
+  // bit 4 for the scalar operation (see
+  // GetAluVectorResultRoundingSensitiveComponents).
   std::vector<uint8_t> alu_rounding_sensitive_results_;
   uint32_t cf_pair_index_bound_ = 0;
   uint32_t register_static_address_bound_ = 0;
