@@ -126,7 +126,7 @@ void test_a64_lse_source_guard(const char* a64_dir_path) {
                       std::istreambuf_iterator<char>());
 
     if (entry.path().filename() == "a64_backend.cc") {
-      auto pos = whole.find("EmitReservedStoreHelper(");
+      auto pos = whole.find("A64HelperEmitter::EmitReservedStoreHelper(");
       if (pos != std::string::npos) {
         found_sc_fn = true;
         auto end = whole.find("\n}\n", pos);
@@ -198,17 +198,31 @@ void test_a64_lse_source_guard(const char* a64_dir_path) {
       ++lse_sites;
       bool guarded = false;
       const size_t lookback = (i > 48) ? (i - 48) : 0;
-      bool in_lse_branch = false;
+      bool has_guard = false;
+      int guard_depth = 0;
+      int depth = 0;
       for (size_t j = lookback; j <= i; ++j) {
-        if (lines[j].find("kA64EmitLSE") != std::string::npos ||
-            lines[j].find("if (lse)") != std::string::npos) {
-          in_lse_branch = true;
+        const bool is_guard =
+            (lines[j].find("if (") != std::string::npos &&
+             (lines[j].find("kA64EmitLSE") != std::string::npos ||
+              lines[j].find("if (lse)") != std::string::npos)) ||
+            lines[j].find("kA64EmitLSE") != std::string::npos;
+        if (is_guard && !has_guard) {
+          has_guard = true;
+          guard_depth = depth;
         }
-        if (in_lse_branch && lines[j].find("} else {") != std::string::npos) {
-          in_lse_branch = false;
+        for (char c : lines[j]) {
+          if (c == '{') {
+            ++depth;
+          } else if (c == '}') {
+            --depth;
+            if (has_guard && depth <= guard_depth) {
+              has_guard = false;
+            }
+          }
         }
       }
-      guarded = in_lse_branch;
+      guarded = has_guard;
       if (!guarded) {
         std::fprintf(stderr, "Unguarded LSE call at %s:%zu: %s\n",
                      entry.path().filename().string().c_str(), i + 1,
