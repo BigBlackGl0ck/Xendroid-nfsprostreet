@@ -161,6 +161,13 @@ class SettingsSchemaTest {
             .forEach { s -> s.options.forEach { assertEquals("${s.key} ${it.value}", 1, it.value.count { c -> c == '.' }) } }
     }
 
+    @Test fun framerate_limit_offers_40_fps_for_120hz_displays() {
+        val s = SettingsSchema.byKey["GPU|framerate_limit"] as Setting.ListChoice
+        assertEquals(listOf("60", "30", "40", "45", "90", "120", "0"), s.options.map { it.value })
+        assertEquals("60", s.default)
+        assertTrue(s.key in SettingsSchema.playerKeys)
+    }
+
     /** vulkan_texture_cache reads -1 (no override) and 0..5 (off, 1x..16x). */
     @Test fun anisotropic_override_offers_the_core_values() {
         val s = SettingsSchema.byKey["GPU|anisotropic_override"] as Setting.ListChoice
