@@ -269,7 +269,12 @@ fun AppNavHost(container: AppContainer) {
         }
         composable(Routes.CONTROLLER_TEST) { entry ->
             val vm: SettingsViewModel = viewModel(factory = container.settingsViewModelFactory())
-            xendroid.compose.ui.controllertest.ControllerTestScreen(onBack = entry.backOnce(nav), global = vm)
+            val go: (String) -> Unit = { route -> if (entry.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) nav.navigate(route) }
+            xendroid.compose.ui.controllertest.ControllerTestScreen(
+                onBack = entry.backOnce(nav),
+                global = vm,
+                onKeymap = { go(Routes.KEYMAP) },
+            )
         }
         composable(Routes.PHONE_CONTROLLER) { entry ->
             val vm: PhoneControllerViewModel = viewModel()

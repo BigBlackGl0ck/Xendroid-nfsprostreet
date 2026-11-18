@@ -324,6 +324,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val inputDeviceListener = object : android.hardware.input.InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) = noteController(deviceId, "connected")
         override fun onInputDeviceRemoved(deviceId: Int) {
+            triggerKeys.deviceRemoved(deviceId)
             controllers.remove(deviceId)?.let { recordEvent("controller", "disconnected ($it)", flush = true) }
             if (deviceId == touchHiddenBy) touchControlsBack("the controller disconnected")
             // Release only what the lost controller held (I04); its player slot frees up.
@@ -337,7 +338,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 }
             }
         }
-        override fun onInputDeviceChanged(deviceId: Int) {}
+        override fun onInputDeviceChanged(deviceId: Int) {
+            triggerKeys.deviceRemoved(deviceId)
+        }
     }
     /** Set when the launch failed visibly, so the run is recorded as FAILED. */
     private var launchFailure: String? = null
@@ -449,6 +452,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val menuState = mutableStateOf(InGameMenuState())
     private val menuPaused = mutableStateOf(false)
     private val editorOpen = mutableStateOf(false)
+    private val keymapOpen = mutableStateOf(false)
+    private val hostToast = xendroid.compose.ui.design.XdToastState()
+    private val hostKeymapVm by lazy { xendroid.compose.ui.keymap.KeymapViewModel(KeymapStore(applicationContext)) }
     private val menuLogSessions = mutableStateOf<List<SessionLogs.Session>>(emptyList())
     private val presentationState = mutableStateOf(PresentationState())
     private val fgGovernor = xendroid.compose.core.FrameGenerationGovernor()
@@ -583,8 +589,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         GameButtons.DEFAULT_LOOKUP
 
     private var vibrator: Vibrator? = null
-    /** #97: (device id << 1 | side) of each trigger whose axis moved; its L2/R2 key then stays out of the guest. */
-    private val analogTriggers = HashSet<Long>()
+    /** #97, #118: live analog-vs-digital trigger arbitration per device/side (without permanent latch). */
+    private val triggerKeys = xendroid.compose.gamepad.AnalogTriggers.TriggerKeys()
     /** #97: what P1's trigger axes last sent. */
     private val triggerSent = xendroid.compose.gamepad.AnalogTriggers.Sent()
 
@@ -664,6 +670,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                     store.androidToGameKey.firstOrNull()
                         ?: GameButtons.DEFAULT_LOOKUP
                 }
+            launch {
+                store.androidToGameKey.collect { keyMap = it }
+            }
 
             showFpsOverlay.value =
                 withContext(Dispatchers.IO) {
@@ -1026,12 +1035,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     private fun playsMotion(event: MotionEvent): Boolean {
-        fun axis(a: Int) = event.getAxisValue(a)
+        val axes = xendroid.compose.gamepad.AnalogTriggers.readPadAxes(event)
         return xendroid.compose.gamepad.PadPlay.plays(
-            axis(MotionEvent.AXIS_X), axis(MotionEvent.AXIS_Y), axis(MotionEvent.AXIS_Z), axis(MotionEvent.AXIS_RZ),
-            maxOf(axis(MotionEvent.AXIS_LTRIGGER), axis(MotionEvent.AXIS_BRAKE)),
-            maxOf(axis(MotionEvent.AXIS_RTRIGGER), axis(MotionEvent.AXIS_GAS)),
-            axis(MotionEvent.AXIS_HAT_X), axis(MotionEvent.AXIS_HAT_Y))
+            axes.lx, axes.ly, axes.rx, axes.ry, axes.lt, axes.rt, axes.hatX, axes.hatY)
     }
 
     /** A press, or a push past half, from a physical controller: playing P1, it puts the
@@ -1947,6 +1953,25 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                                     titleId = activeTitleState.value,
                                     gameName = loadingName,
                                 ) }
+                            } else if (keymapOpen.value) {
+                                xendroidTheme(scale = uiScale, mode = hostMode) {
+                                    androidx.compose.runtime.CompositionLocalProvider(
+                                        xendroid.compose.ui.design.LocalXdToast provides hostToast,
+                                        xendroid.compose.ui.design.LocalSwapConfirm provides swapConfirm,
+                                    ) {
+                                        Box(Modifier.fillMaxSize()) {
+                                            xendroid.compose.ui.keymap.KeymapScreen(
+                                                vm = hostKeymapVm,
+                                                onBack = { keymapOpen.value = false },
+                                                inGame = true,
+                                            )
+                                            xendroid.compose.ui.design.XdToastHost(
+                                                hostToast,
+                                                Modifier.align(Alignment.BottomCenter),
+                                            )
+                                        }
+                                    }
+                                }
                             } else if (menuState.value.open) {
                                 xendroidTheme(scale = uiScale, mode = hostMode) {
                                     // Round 2: the menu's values from this activity's state ([menuModel]).
@@ -2128,12 +2153,15 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                     }
 
                     BackHandler(
-                        enabled = menuOpen && !editorOpen.value && !keyboardOpen && !discOpen && !messageBoxOpen
+                        enabled = menuOpen && !editorOpen.value && !keymapOpen.value && !keyboardOpen && !discOpen && !messageBoxOpen
                     ) {
                         backMenu()
                     }
                     BackHandler(enabled = editorOpen.value && !keyboardOpen && !discOpen && !messageBoxOpen) {
                         editorOpen.value = false
+                    }
+                    BackHandler(enabled = keymapOpen.value && !keyboardOpen && !discOpen && !messageBoxOpen) {
+                        keymapOpen.value = false
                     }
                 }
             }
@@ -2401,14 +2429,14 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             noteControllerUse(event)
         }
         // U10: a controller types on the grid; the focused text field must not eat its D-pad.
-        if (keyboardRequestState.value != null && !editorOpen.value && isControllerEvent(event)) {
+        if (keyboardRequestState.value != null && !editorOpen.value && !keymapOpen.value && isControllerEvent(event)) {
             return when (event.action) {
                 KeyEvent.ACTION_DOWN -> onKeyDown(event.keyCode, event)
                 KeyEvent.ACTION_UP -> onKeyUp(event.keyCode, event)
                 else -> true
             }
         }
-        if (editorOpen.value && !hasGuestPrompt()) {
+        if ((editorOpen.value || keymapOpen.value) && !hasGuestPrompt()) {
             val code = xendroid.compose.gamepad.MenuButtons.frontendKey(event.keyCode, swapConfirm)
                 ?: return super.dispatchKeyEvent(event)
             return super.dispatchKeyEvent(KeyEvent(event.downTime, event.eventTime, event.action, code,
@@ -2421,7 +2449,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         keyCode: Int,
         event: KeyEvent
     ): Boolean {
-        if (editorOpen.value && !hasGuestPrompt()) return super.onKeyDown(keyCode, event)
+        if ((editorOpen.value || keymapOpen.value) && !hasGuestPrompt()) return super.onKeyDown(keyCode, event)
         // Let Android/Compose dispatch Back to the highest-priority BackHandler.
         // Consuming it with other menu keys leaves the pause sheet impossible to close.
         if (keyCode == KeyEvent.KEYCODE_BACK) return super.onKeyDown(keyCode, event)
@@ -2523,7 +2551,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         keyCode: Int,
         event: KeyEvent
     ): Boolean {
-        if (editorOpen.value && !hasGuestPrompt()) return super.onKeyUp(keyCode, event)
+        if ((editorOpen.value || keymapOpen.value) && !hasGuestPrompt()) return super.onKeyUp(keyCode, event)
         val identity = keyIdentity(event)
         if (xendroid.compose.gamepad.MenuButtons.direction(keyCode) != 0) navRepeat.release()
         if (consumedMenuKeys.remove(identity)) return true
@@ -2531,7 +2559,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         // #97: a press that came before the trigger's axis moved is the axis's now; its release
         // would cut the trigger mid-travel.
         if (isAnalogTriggerKey(event)) {
-            sentGuestKeys.remove(identity)
+            sentGuestKeys.remove(identity)?.let { triggerSent.adoptHeldKey(it) }
             if (player > 0) slotInput.forget(player, identity)
             return true
         }
@@ -2593,17 +2621,17 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
-        if (event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK && playsMotion(event)) {
-            claimPlayer(event.deviceId)
+        if (event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK) {
+            val axes = xendroid.compose.gamepad.AnalogTriggers.readPadAxes(event)
+            if (xendroid.compose.gamepad.PadPlay.plays(
+                    axes.lx, axes.ly, axes.rx, axes.ry, axes.lt, axes.rt, axes.hatX, axes.hatY)) {
+                claimPlayer(event.deviceId)
+            }
+            if (xendroid.compose.gamepad.TouchOverlayPresence.pushed(
+                    axes.lx, axes.ly, axes.rx, axes.ry, axes.lt, axes.rt, axes.hatX, axes.hatY)) {
+                noteControllerUse(event)
+            }
         }
-        if (event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK &&
-            xendroid.compose.gamepad.TouchOverlayPresence.pushed(
-                event.getAxisValue(MotionEvent.AXIS_X), event.getAxisValue(MotionEvent.AXIS_Y),
-                event.getAxisValue(MotionEvent.AXIS_Z), event.getAxisValue(MotionEvent.AXIS_RZ),
-                event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
-                event.getAxisValue(MotionEvent.AXIS_BRAKE), event.getAxisValue(MotionEvent.AXIS_GAS),
-                event.getAxisValue(MotionEvent.AXIS_HAT_X), event.getAxisValue(MotionEvent.AXIS_HAT_Y))
-        ) noteControllerUse(event)
         return super.dispatchGenericMotionEvent(event)
     }
 
@@ -2615,94 +2643,48 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private fun onGenericMotion(
         event: MotionEvent
     ): Boolean {
-        if (event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK) noteAnalogTriggers(event)
-        if (editorOpen.value && !hasGuestPrompt()) return super.onGenericMotionEvent(event)
-        if (keyboardRequestState.value != null &&
-            event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK) {
+        val isJoystick = event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+        val axes = if (isJoystick) {
+            xendroid.compose.gamepad.AnalogTriggers.readPadAxes(event).also {
+                noteAnalogTriggers(event.deviceId, it)
+            }
+        } else null
+        if ((editorOpen.value || keymapOpen.value) && !hasGuestPrompt()) return super.onGenericMotionEvent(event)
+        if (keyboardRequestState.value != null && isJoystick) {
             keyboardHat(event)
             return true
         }
         panelNav()?.let { nav ->
-            panelHat(
-                nav,
-                event
-            )
-
+            panelHat(nav, event)
             return true
         }
 
         // #76: a controller that hasn't played sends nothing to the game yet.
         if (isIdleController(event.deviceId)) return true
         val player = playerSlot(event.deviceId)
-        if (player > 0 && event.source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK) {
+        if (player > 0 && axes != null) {
             // Same axes and rules as P1 below; a D-pad that also sends keys has no hat here.
             val hat = isNonDpadSource(event)
-            slotInput.motion(player,
-                event.getAxisValue(MotionEvent.AXIS_X), event.getAxisValue(MotionEvent.AXIS_Y),
-                event.getAxisValue(MotionEvent.AXIS_Z), event.getAxisValue(MotionEvent.AXIS_RZ),
-                maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE)),
-                maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS)),
-                if (hat) event.getAxisValue(MotionEvent.AXIS_HAT_X) else 0f,
-                if (hat) event.getAxisValue(MotionEvent.AXIS_HAT_Y) else 0f,
-                keyMap[KeyEvent.KEYCODE_BUTTON_L2], keyMap[KeyEvent.KEYCODE_BUTTON_R2])
+            slotInput.motion(
+                player,
+                axes.lx, axes.ly, axes.rx, axes.ry, axes.lt, axes.rt,
+                if (hat) axes.hatX else 0f,
+                if (hat) axes.hatY else 0f,
+                keyMap[KeyEvent.KEYCODE_BUTTON_L2], keyMap[KeyEvent.KEYCODE_BUTTON_R2],
+            )
             return true
         }
 
-        val hatHandled =
-            isNonDpadSource(event) &&
-                handleHat(event)
-
-        if (
-            event.source and
-                InputDevice.SOURCE_JOYSTICK !=
-                InputDevice.SOURCE_JOYSTICK
-        ) {
-            return hatHandled ||
-                super.onGenericMotionEvent(
-                    event
-                )
+        val hatHandled = isNonDpadSource(event) && handleHat(event)
+        if (axes == null) {
+            return hatHandled || super.onGenericMotionEvent(event)
         }
 
-        emitAxisPair(
-            event.getAxisValue(
-                MotionEvent.AXIS_X
-            ),
-            negKey = KC_LTHUMB_LEFT,
-            posKey = KC_LTHUMB_RIGHT,
-            invert = false
-        )
-
-        emitAxisPair(
-            event.getAxisValue(
-                MotionEvent.AXIS_Y
-            ),
-            negKey = KC_LTHUMB_UP,
-            posKey = KC_LTHUMB_DOWN,
-            invert = true
-        )
-
-        emitAxisPair(
-            event.getAxisValue(
-                MotionEvent.AXIS_Z
-            ),
-            negKey = KC_RTHUMB_LEFT,
-            posKey = KC_RTHUMB_RIGHT,
-            invert = false
-        )
-
-        emitAxisPair(
-            event.getAxisValue(
-                MotionEvent.AXIS_RZ
-            ),
-            negKey = KC_RTHUMB_UP,
-            posKey = KC_RTHUMB_DOWN,
-            invert = true
-        )
-
-        emitTriggers(
-            maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE)),
-            maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS)))
-
+        emitAxisPair(axes.lx, negKey = KC_LTHUMB_LEFT, posKey = KC_LTHUMB_RIGHT, invert = false)
+        emitAxisPair(axes.ly, negKey = KC_LTHUMB_UP, posKey = KC_LTHUMB_DOWN, invert = true)
+        emitAxisPair(axes.rx, negKey = KC_RTHUMB_LEFT, posKey = KC_RTHUMB_RIGHT, invert = false)
+        emitAxisPair(axes.ry, negKey = KC_RTHUMB_UP, posKey = KC_RTHUMB_DOWN, invert = true)
+        emitTriggers(axes.lt, axes.rt)
         return true
     }
 
@@ -2716,28 +2698,25 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
     }
 
-    private fun noteAnalogTriggers(event: MotionEvent) {
-        val id = event.deviceId.toLong() shl 1
-        val deadzone = xendroid.compose.gamepad.AnalogTriggers.DEADZONE
-        if (maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE)) > deadzone) {
-            analogTriggers += id
-        }
-        if (maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS)) > deadzone) {
-            analogTriggers += id or 1L
+    private fun noteAnalogTriggers(deviceId: Int, axes: xendroid.compose.gamepad.PadAxes) {
+        val handoff = triggerKeys.onAxis(deviceId, axes.lt, axes.rt)
+        if (handoff != 0) {
+            val player = playerSlot(deviceId)
+            if (handoff and 1 != 0) forgetTriggerKey(deviceId, player, KeyEvent.KEYCODE_BUTTON_L2)
+            if (handoff and 2 != 0) forgetTriggerKey(deviceId, player, KeyEvent.KEYCODE_BUTTON_R2)
         }
     }
 
-    /** A pad that sends a trigger as an axis may also send its L2/R2 key past a point of its own:
-     *  once that axis has moved it carries the trigger, as a key arriving after the last motion
-     *  sample would leave the guest's trigger full. */
-    private fun isAnalogTriggerKey(event: KeyEvent): Boolean {
-        val side = when (event.keyCode) {
-            KeyEvent.KEYCODE_BUTTON_L2 -> 0L
-            KeyEvent.KEYCODE_BUTTON_R2 -> 1L
-            else -> return false
-        }
-        return ((event.deviceId.toLong() shl 1) or side) in analogTriggers
+    private fun forgetTriggerKey(deviceId: Int, player: Int, keyCode: Int) {
+        val id = (deviceId.toLong() shl 32) or (keyCode.toLong() and 0xffffffffL)
+        sentGuestKeys.remove(id)?.let { triggerSent.adoptHeldKey(it) }
+        if (player > 0) slotInput.forget(player, id)
     }
+
+    /** #97, #118: while a trigger's analog axis is active, its companion L2/R2 key stays out of the guest;
+     *  once the axis is back at rest, digital L2/R2 presses work again immediately (e.g. Odin Digital mode). */
+    private fun isAnalogTriggerKey(event: KeyEvent): Boolean =
+        triggerKeys.isAxisActiveForKey(event.deviceId, event.keyCode)
 
     private fun emitAxisPair(
         axis: Float,
@@ -2977,6 +2956,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 }
             )
         }
+        if (editorOpen.value || keymapOpen.value) return null
 
         keyboardRequestState.value?.let {
             return PanelNav(
@@ -3308,6 +3288,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                         // U08: a controller with its own intensity says it.
                         "P${player.index + 1}" + (player.value?.let { rumbleSettings.value.perDevice[it] }?.let { " (${rumbleNames.getValue(it)})" } ?: "")
                     }.ifEmpty { stringResource(R.string.menu_no_controller) }),
+            InGameAction.KEY_MAPPING to MenuValue(text = stringResource(R.string.xd_km_sub)),
             InGameAction.PHONE_CONTROLLERS to MenuValue(text = phoneControllersLabel.value ?: stringResource(R.string.phone_ctl_off)),
             InGameAction.UNBUFFERED_INPUT to MenuValue(on = unbufferedInput.value),
             InGameAction.GYRO_CAMERA to MenuValue(on = gyroEnabled.value, enabled = gyroAvailable,
@@ -3433,12 +3414,22 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             InGameAction.LSFG -> runLsfg(action)
             InGameAction.WINFG -> runWinFg(action)
             InGameAction.EDIT_TOUCH_LAYOUT -> {
+                panelNavPrev = false; panelNavNext = false; panelNavLeft = false; panelNavRight = false
                 if (session.booted && !session.isPaused()) {
                     session.pause()
                     menuState.value = menuState.value.copy(pausedByMenu = true)
                 }
                 menuPaused.value = session.isPaused()
                 editorOpen.value = true
+            }
+            InGameAction.KEY_MAPPING -> {
+                panelNavPrev = false; panelNavNext = false; panelNavLeft = false; panelNavRight = false
+                if (session.booted && !session.isPaused()) {
+                    session.pause()
+                    menuState.value = menuState.value.copy(pausedByMenu = true)
+                }
+                menuPaused.value = session.isPaused()
+                keymapOpen.value = true
             }
             InGameAction.STRETCH -> {
                 if (fpsConfig.value.loading || fpsConfig.value.saving || fpsConfig.value.error != null) return
@@ -4154,6 +4145,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         // The triggers, or the buttons the mapping puts them on (#97).
         triggerSent.releaseAll().forEach { session.keyEvent(it.key, false, it.value) }
+        triggerKeys.clear()
         if (hatLeft) session.keyEvent(KC_DPAD_LEFT, false, KEY_VALUE_UNUSED)
         if (hatRight) session.keyEvent(KC_DPAD_RIGHT, false, KEY_VALUE_UNUSED)
         if (hatUp) session.keyEvent(KC_DPAD_UP, false, KEY_VALUE_UNUSED)
@@ -4226,7 +4218,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     /** The menu is open on its rows (not asking to quit or for a log): ←→ adjust there. */
     private fun menuRowsActive(): Boolean =
-        menuState.value.open && !editorOpen.value &&
+        menuState.value.open && !editorOpen.value && !keymapOpen.value &&
             !hasGuestPrompt() && !menuState.value.confirmingQuit && !menuState.value.logPicker
 
     private fun adjustSelectedRow(delta: Int) {

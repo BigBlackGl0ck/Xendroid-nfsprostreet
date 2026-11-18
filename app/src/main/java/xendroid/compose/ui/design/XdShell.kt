@@ -445,7 +445,7 @@ fun XdSingleScreen(
 ) {
     val c = Xd.colors
     if (Xd.controller) {
-        CFrame(modifier, art = null, hints = hints ?: defaultHints(sections = false), onPad = onPad, overlay = overlay) { _ ->
+        CFrame(modifier, art = null, hints = hints ?: defaultHints(sections = false, showMenu = showNav), onPad = onPad, overlay = overlay, allowGuide = showNav) { _ ->
             Column(Modifier.fillMaxSize()) {
                 CHead(title, subtitle, onBack, lead = null, headIcon = headIcon, actions = actions)
                 val body = Modifier.weight(1f).fillMaxWidth()
@@ -490,7 +490,7 @@ fun CBackground(art: Any?, modifier: Modifier = Modifier) {
 
 /** Default hints of a controller screen. */
 @Composable
-fun defaultHints(sections: Boolean, onMenu: (() -> Unit)? = null): List<XdHint> {
+fun defaultHints(sections: Boolean, onMenu: (() -> Unit)? = null, showMenu: Boolean = true): List<XdHint> {
     val swap = LocalSwapConfirm.current
     val list = mutableListOf(
         XdHint(if (swap) "B" else "A", stringResource(R.string.xd_hint_select)),
@@ -498,7 +498,7 @@ fun defaultHints(sections: Boolean, onMenu: (() -> Unit)? = null): List<XdHint> 
     )
     if (sections) list += XdHint("LB/RB", stringResource(R.string.xd_hint_sections))
     list += XdHint("LT/RT", stringResource(R.string.xd_hint_page))
-    list += XdHint("≡", stringResource(R.string.xd_hint_menu), onMenu)
+    if (showMenu) list += XdHint("≡", stringResource(R.string.xd_hint_menu), onMenu)
     return list
 }
 
@@ -593,11 +593,16 @@ fun CFrame(
     onShoulder: ((Int) -> Unit)? = null,
     onPad: ((PadButton) -> Boolean)? = null,
     overlay: (@Composable BoxScope.() -> Unit)? = null,
+    allowGuide: Boolean = true,
     content: @Composable BoxScope.(openGuide: () -> Unit) -> Unit,
 ) {
     var guide by remember { mutableStateOf(false) }
-    val openGuide = { guide = true }
-    val withMenu = hints.map { if (it.buttons == "≡" && it.onClick == null) XdHint(it.buttons, it.label, openGuide) else it }
+    val openGuide = { if (allowGuide) guide = true }
+    val withMenu = if (allowGuide) {
+        hints.map { if (it.buttons == "≡" && it.onClick == null) XdHint(it.buttons, it.label, openGuide) else it }
+    } else {
+        hints.filterNot { it.buttons == "≡" && it.onClick == null }
+    }
     val focus = LocalFocusManager.current
     BoxWithConstraints(
         modifier.fillMaxSize()
@@ -606,7 +611,7 @@ fun CFrame(
                     null -> false
                     else -> when {
                         onPad?.invoke(b) == true -> true
-                        b == PadButton.START -> { guide = !guide; true }
+                        b == PadButton.START && allowGuide -> { guide = !guide; true }
                         b == PadButton.LB && onShoulder != null -> { onShoulder(-1); true }
                         b == PadButton.RB && onShoulder != null -> { onShoulder(1); true }
                         // Round 2: LT/RT go a page up or down, several rows at once (the list follows).
@@ -624,7 +629,7 @@ fun CFrame(
         }
         overlay?.invoke(this)
     }
-    if (guide) CGuide(onDismiss = { guide = false })
+    if (guide && allowGuide) CGuide(onDismiss = { guide = false })
 }
 
 @Composable
