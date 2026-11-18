@@ -636,8 +636,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       }
     }
   }
-  ext_1_3_KHR_dynamic_rendering =
-      device->extensions_.ext_1_3_KHR_dynamic_rendering;
   const auto erase_enabled_extension = [&](const char* ext_name) {
     enabled_extensions.erase(
         std::remove_if(
@@ -1593,7 +1591,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
             shaderDemoteToHelperInvocation);
       }
     }
-    if (ext_1_3_KHR_dynamic_rendering) {
+    if (device->extensions_.ext_1_3_KHR_dynamic_rendering) {
       if (with_gpu_emulation && !mali_block_dynamic_rendering) {
         XE_UI_VULKAN_FEATURE_2(features_1_3_KHR_dynamic_rendering,
                                dynamicRendering);
