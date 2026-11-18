@@ -10,6 +10,7 @@
 #include "xenia/gpu/spirv_shader_translator.h"
 
 #include <cmath>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 #include <set>
@@ -239,9 +240,17 @@ namespace xe {
 namespace gpu {
 
 namespace {
-// Cache for auto-detected SPIR-V version to avoid re-testing on every
-// Features construction.
-static std::optional<spv::SpvVersion> g_cached_spirv_version;
+// Cache for auto-detected SPIR-V version keyed by device/driver identity so
+// switching Vulkan drivers at runtime on Android never reuses a version probed
+// on a different driver (e.g. Qualcomm 1.1 <-> Turnip 1.0 on Adreno 610).
+struct CachedSpirvVersion {
+  VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+  uint32_t api_version = 0;
+  uint32_t driver_version = 0;
+  spv::SpvVersion spirv_version = spv::Spv_1_0;
+};
+static std::mutex g_cached_spirv_version_mutex;
+static std::optional<CachedSpirvVersion> g_cached_spirv_version;
 
 // Tests if a SPIR-V version is supported by generating a minimal shader using
 // the same SpirvBuilder used at runtime for game shaders
@@ -364,24 +373,43 @@ SpirvShaderTranslator::Features::Features(
     spirv_version = spv::Spv_1_6;
     XELOGD("SPIR-V version override: 1.6");
   } else {
-    // Auto-detect based on actual driver support testing.
-    // Use cached result if already detected.
-    if (g_cached_spirv_version.has_value()) {
-      spirv_version = g_cached_spirv_version.value();
+    // Auto-detect bounded by the device's Vulkan API version (per
+    // VUID-VkShaderModuleCreateInfo-pCode-01379: SPIR-V 1.3 requires Vulkan 1.1,
+    // SPIR-V 1.4 requires VK_KHR_spirv_1_4 or Vulkan 1.2, SPIR-V 1.5 requires
+    // Vulkan 1.2).
+    const uint32_t device_api_version = vulkan_device->properties().apiVersion;
+    const uint32_t device_driver_version =
+        vulkan_device->properties().driverVersion;
+    const VkPhysicalDevice physical_device = vulkan_device->physical_device();
+    std::lock_guard<std::mutex> cache_lock(g_cached_spirv_version_mutex);
+    if (g_cached_spirv_version.has_value() &&
+        g_cached_spirv_version->physical_device == physical_device &&
+        g_cached_spirv_version->api_version == device_api_version &&
+        g_cached_spirv_version->driver_version == device_driver_version) {
+      spirv_version = g_cached_spirv_version->spirv_version;
     } else {
-      // Test SPIR-V 1.5, fall back to 1.0 if it fails.
-      XELOGI("Testing SPIR-V 1.5 support...");
-
-      if (TestSpirvVersionSupport(vulkan_device, spv::Spv_1_5)) {
+      if (device_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0) &&
+          TestSpirvVersionSupport(vulkan_device, spv::Spv_1_5)) {
         spirv_version = spv::Spv_1_5;
         XELOGI("SPIR-V 1.5 test: PASSED - using SPIR-V 1.5");
+      } else if (device_api_version >= VK_MAKE_API_VERSION(0, 1, 1, 0) &&
+                 vulkan_device->extensions().ext_1_2_KHR_spirv_1_4 &&
+                 TestSpirvVersionSupport(vulkan_device, spv::Spv_1_4)) {
+        spirv_version = spv::Spv_1_4;
+        XELOGI("SPIR-V 1.4 test: PASSED - using SPIR-V 1.4");
+      } else if (device_api_version >= VK_MAKE_API_VERSION(0, 1, 1, 0) &&
+                 TestSpirvVersionSupport(vulkan_device, spv::Spv_1_3)) {
+        spirv_version = spv::Spv_1_3;
+        XELOGI("SPIR-V 1.3 test: PASSED - using SPIR-V 1.3");
       } else {
         spirv_version = spv::Spv_1_0;
-        XELOGW("SPIR-V 1.5 test: FAILED - falling back to SPIR-V 1.0");
+        XELOGI("Using SPIR-V 1.0 (Vulkan API {}.{})",
+               VK_API_VERSION_MAJOR(device_api_version),
+               VK_API_VERSION_MINOR(device_api_version));
       }
-
-      // Cache the detected version
-      g_cached_spirv_version = static_cast<spv::SpvVersion>(spirv_version);
+      g_cached_spirv_version = CachedSpirvVersion{
+          physical_device, device_api_version, device_driver_version,
+          static_cast<spv::SpvVersion>(spirv_version)};
     }
   }
 }
