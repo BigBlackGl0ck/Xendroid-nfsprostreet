@@ -1620,14 +1620,21 @@ void Emulator::Pause() {
   if (paused_.exchange(true)) {
     return;
   }
-  Clock::HoldGuestTime(true);
 
-  // Soft pause: park the progress sources and let guest threads settle on
-  // their own waits. Suspending threads mid-operation loses in-flight
-  // cross-thread completions (permanent Skate 3 deadlock). Audio first so an
-  // in-flight guest audio callback drains while the CP and vblank are live.
+  // Park the subsystems while the guest clock still runs: the vblank pacer on
+  // Android derives its deadlines from QueryGuestTickCount(), and a mid-packet
+  // WAIT_REG_MEM in the command processor can only drain while vblanks keep
+  // advancing. Holding the guest clock first freezes that pacer, so the packet
+  // never completes, CommandProcessor::Pause() never parks, and the caller
+  // (the Android main thread, for the in-game menu) blocks on the fence until
+  // the system reports an ANR. Audio first so an in-flight guest audio callback
+  // drains while the CP and vblank are live.
   audio_system_->Pause();
   graphics_system_->Pause();
+
+  // Only once every thread is parked: the guest time must not advance while
+  // paused, but it has to advance until the park has actually happened.
+  Clock::HoldGuestTime(true);
 
   XELOGI("! EMULATOR PAUSED !");
 }
