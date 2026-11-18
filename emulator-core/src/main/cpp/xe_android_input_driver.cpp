@@ -85,15 +85,17 @@ namespace xe {
                 out_caps->type = 0x01;      // XINPUT_DEVTYPE_GAMEPAD
                 out_caps->sub_type = 0x01;  // XINPUT_DEVSUBTYPE_GAMEPAD
                 out_caps->flags = 0;
-                out_caps->gamepad.buttons = 0xFFFF;
+                // Match Edge's SDL driver (valid X360 gamepad buttons + Guide, without reserved bit 0x0800)
+                // and advertise vibration motors so games checking X_INPUT_CAPABILITIES enable rumble (#118).
+                out_caps->gamepad.buttons = 0xF3FFu | 0x0400u;
                 out_caps->gamepad.left_trigger = 0xFF;
                 out_caps->gamepad.right_trigger = 0xFF;
                 out_caps->gamepad.thumb_lx = (int16_t)0xFFFFu;
                 out_caps->gamepad.thumb_ly = (int16_t)0xFFFFu;
                 out_caps->gamepad.thumb_rx = (int16_t)0xFFFFu;
                 out_caps->gamepad.thumb_ry = (int16_t)0xFFFFu;
-                out_caps->vibration.left_motor_speed = 0;
-                out_caps->vibration.right_motor_speed = 0;
+                out_caps->vibration.left_motor_speed = 0xFFFFu;
+                out_caps->vibration.right_motor_speed = 0xFFFFu;
                 return X_ERROR_SUCCESS;
             }
 

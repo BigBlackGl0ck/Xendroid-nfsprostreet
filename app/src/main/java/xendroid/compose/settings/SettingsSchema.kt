@@ -24,7 +24,7 @@ object SettingsSchema {
             b("Vulkan", "vulkan_log_debug_messages", "Log debug messages", false),
             b("Vulkan", "vulkan_validation", "Validation layers", false),
             b("Vulkan", "vulkan_renderdoc_capture", "RenderDoc capture layer", false),
-            b("Vulkan", "vulkan_allow_present_mode_immediate", "Allow present mode: immediate", true),
+            b("Vulkan", "vulkan_allow_present_mode_immediate", "Allow present mode: immediate", false),
             b("Vulkan", "vulkan_allow_present_mode_mailbox", "Allow present mode: mailbox", false),
             b("Vulkan", "vulkan_allow_present_mode_fifo_relaxed", "Allow present mode: FIFO relaxed", true),
             b("Vulkan", "vulkan_async_skip_draws", "Async skip draws", true),
@@ -188,7 +188,7 @@ object SettingsSchema {
             // A dropdown, not a slider: only a few values are meaningful, and "unlimited"
             // needs to be an explicit choice rather than the bottom of a range.
             l("GPU", "framerate_limit", "Frame rate limit", "60",
-                "60" to "60 FPS", "30" to "30 FPS", "45" to "45 FPS",
+                "60" to "60 FPS", "30" to "30 FPS", "40" to "40 FPS", "45" to "45 FPS",
                 "90" to "90 FPS", "120" to "120 FPS", "0" to "Unlimited"),
             b("GPU", "guest_display_refresh_cap", "Cap guest display refresh (VSync)", true),
             // vulkan_texture_cache: -1 leaves each sampler as the game set it.
