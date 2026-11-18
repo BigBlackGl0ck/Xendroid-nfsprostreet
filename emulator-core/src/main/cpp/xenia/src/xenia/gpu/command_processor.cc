@@ -2252,6 +2252,14 @@ void CommandProcessor::AwaitHeldSignalsWriting(uint32_t physical_address) {
   PerformHeldSignals(await_count);
 }
 
+void CommandProcessor::AwaitHeldSignalsAndMemexport() {
+  uint64_t submission = TakeMemexportSignalSubmission();
+  if (submission > GetCompletedSubmission()) {
+    AwaitSubmissionForHeldSignals(submission);
+  }
+  PerformHeldSignals(held_guest_signals_.size());
+}
+
 void CommandProcessor::PerformHeldSignals(size_t await_count) {
   constexpr auto kMaxHold = std::chrono::seconds(1);
   while (!held_guest_signals_.empty()) {
@@ -2264,6 +2272,12 @@ void CommandProcessor::PerformHeldSignals(size_t await_count) {
           return;
         }
         AwaitSubmissionForHeldSignals(signal.submission);
+        if (signal.submission > GetCompletedSubmission()) {
+          XELOGE(
+              "HeldGuestSignal: submission {} incomplete after await "
+              "(completed {})",
+              signal.submission, GetCompletedSubmission());
+        }
       }
     }
     PerformGuestSignal(signal);
@@ -2285,7 +2299,10 @@ void CommandProcessor::BeginVIZQuery(uint32_t id) {
     viz_active_generation_ = kInvalidVIZGeneration;
   }
   VIZQuery& query = viz_queries_[id];
-  const uint64_t generation = query.generation + 1;
+  uint64_t generation = (query.generation + 1) & kVIZGenerationMask;
+  if (generation == kInvalidVIZGeneration) {
+    generation = 1;
+  }
   query = {};
   query.generation = generation;
   query.resolved = false;
@@ -2324,6 +2341,19 @@ void CommandProcessor::EndVIZQuery(uint32_t id) {
   } else {
     status_reg &= ~bit;
   }
+}
+
+void CommandProcessor::RecordVIZQuerySegment(uint32_t id, uint64_t generation,
+                                             uint64_t submission) {
+  id &= 0x3Fu;
+  VIZQuery& query = viz_queries_[id];
+  if (!query.active || query.generation != generation) {
+    return;
+  }
+  ++query.pending_segments;
+  ++viz_pending_resolves_;
+  query.last_segment_end_submission =
+      std::max(query.last_segment_end_submission, submission);
 }
 
 void CommandProcessor::OnVIZSurveyDraw(bool measured) {
@@ -2604,7 +2634,9 @@ bool CommandProcessor::BeginZPDReport(uint32_t report_address) {
   }
 
   ReportHandle report_handle = zpd_next_report_handle_++;
-  if (report_handle == kInvalidReportHandle) {
+  if (report_handle == kInvalidReportHandle ||
+      IsVIZReportHandle(report_handle)) {
+    zpd_next_report_handle_ = 1;
     report_handle = zpd_next_report_handle_++;
   }
 

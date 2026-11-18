@@ -44,6 +44,8 @@ DECLARE_int32(occlusion_query_fake_upper_threshold);
 
 DECLARE_bool(occlusion_query_log);
 
+DECLARE_bool(occlusion_query_viz);
+
 DECLARE_int32(occlusion_query_querybatch_range);
 
 DECLARE_double(occlusion_query_saturation);

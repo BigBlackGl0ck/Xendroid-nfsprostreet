@@ -1547,6 +1547,21 @@ bool VulkanPipelineCache::CanUseShaderObjects(
       !vulkan_device->properties().shaderObject) {
     return false;
   }
+  // VK_EXT_shader_object draws are invalid inside traditional vkCmdBeginRenderPass
+  // (VUID-vkCmdDraw-renderPass-08878) and require dynamic rendering + full
+  // EDS1/EDS3 dynamic state setters in UpdateDynamicState.
+  if (!cvars::vulkan_dynamic_rendering ||
+      !vulkan_device->properties().dynamicRendering) {
+    return false;
+  }
+  if (!dynamic_state_capabilities_.extended_dynamic_state ||
+      !dynamic_state_capabilities_.depth_clamp_enable ||
+      !dynamic_state_capabilities_.polygon_mode ||
+      !dynamic_state_capabilities_.color_blend_enable ||
+      !dynamic_state_capabilities_.color_blend_equation ||
+      !dynamic_state_capabilities_.color_write_mask) {
+    return false;
+  }
   if (render_target_cache_.GetPath() !=
       RenderTargetCache::Path::kHostRenderTargets) {
     return false;
@@ -2131,9 +2146,8 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     description_out.texture_sign_classes = texture_sign_classes_ & 0xFFFF;
     description_out.texture_exp_adjust_zero = texture_exp_adjust_zero_ ? 1 : 0;
     description_out.texture_integer_scale_used =
-        cvars::spirv_texture_iscale_specialization
-            ? (texture_integer_scale_used_ & 0xFFu)
-            : 0u;
+        cvars::spirv_texture_iscale_specialization ? texture_integer_scale_used_
+                                                   : 0u;
   }
   // Same normalization as the framebuffer key: the loadOp discard bits do not
   // affect pipeline compatibility under dynamic rendering, and letting them
@@ -3669,11 +3683,11 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
                        sizeof(description.pixel_shader_hash));
     XXH3_64bits_update(&hstate, &description.pixel_shader_modification,
                        sizeof(description.pixel_shader_modification));
-    uint32_t fs_spec_bits =
-        (description.texture_sign_classes & 0xFFFFu) |
-        ((description.texture_exp_adjust_zero ? 1u : 0u) << 16) |
-        (uint32_t(description.texture_integer_scale_used) << 17) |
-        (has_fs ? (1u << 25) : 0u);
+    uint64_t fs_spec_bits =
+        uint64_t(description.texture_sign_classes & 0xFFFFu) |
+        (uint64_t(description.texture_exp_adjust_zero ? 1u : 0u) << 16) |
+        (uint64_t(description.texture_integer_scale_used) << 17) |
+        (has_fs ? (UINT64_C(1) << 49) : 0ull);
     XXH3_64bits_update(&hstate, &fs_spec_bits, sizeof(fs_spec_bits));
     XXH3_64bits_update(&hstate, &pipeline_create_info.layout,
                        sizeof(pipeline_create_info.layout));

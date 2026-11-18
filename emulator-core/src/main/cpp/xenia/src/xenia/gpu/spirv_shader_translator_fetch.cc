@@ -666,12 +666,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                 &derivative_component_index)) {
       derivative_components_remaining &=
           ~(UINT32_C(1) << derivative_component_index);
-      result[derivative_component_index] = builder_->createUnaryOp(
-          (derivative_component_index & 0b01) ? spv::OpDPdyCoarse
-                                              : spv::OpDPdxCoarse,
+      result[derivative_component_index] = ScaleDerivativeToGuestPixels(
           type_float_,
-          (derivative_component_index & 0b10) ? derivative_function_y
-                                              : derivative_function_x);
+          builder_->createUnaryOp(
+              (derivative_component_index & 0b01) ? spv::OpDPdyCoarse
+                                                  : spv::OpDPdxCoarse,
+              type_float_,
+              (derivative_component_index & 0b10) ? derivative_function_y
+                                                  : derivative_function_x));
     }
   } else {
     // kTextureFetch, kGetTextureComputedLod or kGetTextureWeights.
@@ -1905,6 +1907,13 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
              (instr.dimension == xenos::FetchOpDimension::k2D &&
               cvars::spirv_texture_implicit_lod &&
               !cvars::texture_gradient_exp_bias));
+        if (use_lod_bias && IsDrawSamplesAsPixels() &&
+            !IsDrawSamplesAsPixelsCoarse()) {
+          // 2x2 host pixels per guest pixel halves implicit derivatives (-1 LOD
+          // level); compensate with +1.0 LOD bias.
+          lod = builder_->createNoContractionBinOp(
+              spv::OpFAdd, type_float_, lod, builder_->makeFloatConstant(1.0f));
+        }
 
         // Calculate the gradients for sampling the texture if needed.
         // 2D vectors for k1D (because 1D images are emulated as 2D arrays),
@@ -1963,16 +1972,24 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               builder_->addCapability(spv::CapabilityDerivativeControl);
               // For wide 1D textures, coordinates[0] and coordinates[1]
               // have been remapped. Compute gradients from both.
-              gradient_h_x = builder_->createUnaryOp(
-                  spv::OpDPdxCoarse, type_float_, coordinates[0]);
-              gradient_v_x = builder_->createUnaryOp(
-                  spv::OpDPdyCoarse, type_float_, coordinates[0]);
+              gradient_h_x = ScaleDerivativeToGuestPixels(
+                  type_float_,
+                  builder_->createUnaryOp(spv::OpDPdxCoarse, type_float_,
+                                          coordinates[0]));
+              gradient_v_x = ScaleDerivativeToGuestPixels(
+                  type_float_,
+                  builder_->createUnaryOp(spv::OpDPdyCoarse, type_float_,
+                                          coordinates[0]));
               // For wide 1D textures, also compute Y gradients.
               // coordinates[1] is non-zero only for wide 1D.
-              gradient_h_y = builder_->createUnaryOp(
-                  spv::OpDPdxCoarse, type_float_, coordinates[1]);
-              gradient_v_y = builder_->createUnaryOp(
-                  spv::OpDPdyCoarse, type_float_, coordinates[1]);
+              gradient_h_y = ScaleDerivativeToGuestPixels(
+                  type_float_,
+                  builder_->createUnaryOp(spv::OpDPdxCoarse, type_float_,
+                                          coordinates[1]));
+              gradient_v_y = ScaleDerivativeToGuestPixels(
+                  type_float_,
+                  builder_->createUnaryOp(spv::OpDPdyCoarse, type_float_,
+                                          coordinates[1]));
               gradient_h_x = builder_->createNoContractionBinOp(
                   spv::OpFMul, type_float_, gradient_h_x, lod_gradient_scale_h);
               gradient_v_x = builder_->createNoContractionBinOp(
@@ -2032,12 +2049,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                     builder_->createCompositeConstruct(type_float2_,
                                                        id_vector_temp_);
                 builder_->addCapability(spv::CapabilityDerivativeControl);
-                gradients_h =
+                gradients_h = ScaleDerivativeToGuestPixels(
+                    type_float2_,
                     builder_->createUnaryOp(spv::OpDPdxCoarse, type_float2_,
-                                            gradient_coordinate_vector);
-                gradients_v =
+                                            gradient_coordinate_vector));
+                gradients_v = ScaleDerivativeToGuestPixels(
+                    type_float2_,
                     builder_->createUnaryOp(spv::OpDPdyCoarse, type_float2_,
-                                            gradient_coordinate_vector);
+                                            gradient_coordinate_vector));
               }
               gradients_h = builder_->createNoContractionBinOp(
                   spv::OpVectorTimesScalar, type_float2_, gradients_h,
@@ -2079,12 +2098,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                     builder_->createCompositeConstruct(type_float3_,
                                                        id_vector_temp_);
                 builder_->addCapability(spv::CapabilityDerivativeControl);
-                gradients_h =
+                gradients_h = ScaleDerivativeToGuestPixels(
+                    type_float3_,
                     builder_->createUnaryOp(spv::OpDPdxCoarse, type_float3_,
-                                            gradient_coordinate_vector);
-                gradients_v =
+                                            gradient_coordinate_vector));
+                gradients_v = ScaleDerivativeToGuestPixels(
+                    type_float3_,
                     builder_->createUnaryOp(spv::OpDPdyCoarse, type_float3_,
-                                            gradient_coordinate_vector);
+                                            gradient_coordinate_vector));
               }
               gradients_h = builder_->createNoContractionBinOp(
                   spv::OpVectorTimesScalar, type_float3_, gradients_h,
@@ -3309,6 +3330,16 @@ void SpirvShaderTranslator::SampleTexture(
   }
 }
 
+spv::Id SpirvShaderTranslator::ScaleDerivativeToGuestPixels(
+    spv::Id type, spv::Id derivative) {
+  if (!IsDrawSamplesAsPixels() || IsDrawSamplesAsPixelsCoarse()) {
+    return derivative;
+  }
+  return builder_->createNoContractionBinOp(
+      type == type_float_ ? spv::OpFMul : spv::OpVectorTimesScalar, type,
+      derivative, builder_->makeFloatConstant(2.0f));
+}
+
 spv::Id SpirvShaderTranslator::QueryTextureLod(
     spv::Builder::TextureParameters& texture_parameters, spv::Id image_unsigned,
     spv::Id image_signed, spv::Id sampler, spv::Id is_all_signed) {
@@ -3339,7 +3370,12 @@ spv::Id SpirvShaderTranslator::QueryTextureLod(
         type_float_, 1);
   }
   if_signed.makeEndIf();
-  return if_signed.createMergePhi(lod_signed, lod_unsigned);
+  spv::Id lod = if_signed.createMergePhi(lod_signed, lod_unsigned);
+  if (IsDrawSamplesAsPixels() && !IsDrawSamplesAsPixelsCoarse()) {
+    lod = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float_, lod, builder_->makeFloatConstant(1.0f));
+  }
+  return lod;
 }
 
 }  // namespace gpu

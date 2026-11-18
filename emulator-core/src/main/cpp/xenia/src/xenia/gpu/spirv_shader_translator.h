@@ -153,6 +153,25 @@ class SpirvShaderTranslator : public ShaderTranslator {
     }
   };
 
+  // Whether a 4x-as-2x2 samples-as-pixels pixel shader may execute at 2x2
+  // coarse fragment shading rate (where coarse derivatives already span one
+  // guest pixel and need no 2x scaling). Must agree 1:1 with the command
+  // processor's 2x2 VRS decision.
+  static bool IsSamplesAsPixelsCoarseAllowed(Modification modification,
+                                             bool shader_writes_depth,
+                                             bool shader_kills_or_exports,
+                                             bool shader_fable2_float24_depth) {
+    if (!modification.pixel.resolution_scale_native || shader_writes_depth ||
+        shader_kills_or_exports || shader_fable2_float24_depth ||
+        modification.pixel.dynamic_addressable_register_count >= 126) {
+      return false;
+    }
+    return modification.pixel.depth_stencil_mode ==
+               Modification::DepthStencilMode::kEarlyHint ||
+           modification.pixel.depth_stencil_mode ==
+               Modification::DepthStencilMode::kNoAlphaTests;
+  }
+
   enum : uint32_t {
     kSysFlag_VertexIndexLoad_Shift,
     kSysFlag_ComputeOrPrimitiveVertexIndexLoad_Shift,
@@ -520,6 +539,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool rewrite_scalar_select = false;
     // VK_KHR_buffer_device_address support for optional BDA shared memory.
     bool buffer_device_address = false;
+    // VK_KHR_fragment_shading_rate pipelineFragmentShadingRate for 2x2 coarse
+    // shading on 4x-as-2x2 samples-as-pixels draws.
+    bool samples_as_pixels_coarse = false;
   };
 
   SpirvShaderTranslator(const Features& features,
@@ -1147,6 +1169,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
            draw_resolution_scale_y_ == 1 &&
            GetSpirvShaderModification().pixel.resolution_scale_native;
   }
+  bool IsDrawSamplesAsPixelsCoarse() const;
+  spv::Id ScaleDerivativeToGuestPixels(spv::Id type, spv::Id derivative);
   uint32_t GetCurrentDrawResolutionScaleX() const {
     return is_pixel_shader() &&
                    GetSpirvShaderModification().pixel.resolution_scale_native
@@ -1353,7 +1377,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id input_workgroup_id_ = spv::NoResult;
   // Output for real vertex shaders, Private for the memory export compute
   // shader, which has no stage outputs.
-  spv::StorageClass vs_output_storage_class_ = spv::StorageClassOutput;
+  spv::StorageClass vs_output_storage_class_ = spv::StorageClass::Output;
   // VS as TES only - per-control-point float array carrying the patch/control
   // point index computed by the host vertex and hull shaders.
   spv::Id input_control_point_index_;

@@ -686,7 +686,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // command_processor_memexport.inc: the submission of the last export, not the
   // whole queue. Always inlined for VkAwaitSites too.
   XE_FORCEINLINE bool AwaitMemexportSubmission(uint64_t submission) {
-    if (memexport_batch_.size && !memexport_batch_flushing_) {
+    if (memexport_compute_batch_.size && !memexport_batch_flushing_) {
       FlushMemExportBatch();
     }
     CheckSubmissionCompletionAndDeviceLoss(submission);
@@ -1727,8 +1727,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
     bool fetch_decoded = false;
     uint32_t max_vertex_count = 0;
     std::vector<uint8_t> system, float_vertex, bool_loop, fetch;
+    std::vector<std::pair<uint32_t, uint32_t>> exported_ranges;
   };
-  MemExportBatch memexport_batch_;
+  MemExportBatch memexport_compute_batch_;
   bool memexport_batch_flushing_ = false;
   bool memexport_batch_supported_ = false;
   uint64_t memexport_batched_draws_ = 0;
@@ -1737,7 +1738,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void PushMemexportAfterBarrier();
   void AddToMemExportBatch(VkPipeline pipeline, VkPipelineLayout layout,
                            uint32_t set_count, uint32_t float_constant_count,
-                           uint32_t vertex_count);
+                           uint32_t vertex_count,
+                           const uint32_t* vfetch_addresses,
+                           const uint32_t* vfetch_sizes, uint32_t vfetch_count,
+                           uint32_t guest_index_base, uint32_t index_bytes);
   void FlushMemExportBatch();
 
   size_t pass_splice_placeholder_ = SIZE_MAX;

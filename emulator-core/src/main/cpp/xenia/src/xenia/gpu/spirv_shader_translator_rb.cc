@@ -4372,6 +4372,36 @@ void SpirvShaderTranslator::FSI_AlphaToMask() {
                                   id_vector_temp_),
       spv::NoPrecision);
 
+  if (samples_as_pixels_sample_index != spv::NoResult) {
+    // One guest sample per host pixel (4x_as_2x2): RB_SURFACE_INFO has already
+    // been rewritten to k1X (msaa_samples == 0), so evaluate this 2x2
+    // quadrant's 4x threshold ({0.75, 0.25, 0.5, 1.0} - offset / 16) directly
+    // and discard on failure before LoadMsaaSamplesFromFlags().
+    id_vector_temp_.clear();
+    for (float threshold_base : {0.75f, 0.25f, 0.5f, 1.0f}) {
+      id_vector_temp_.push_back(builder_->makeFloatConstant(threshold_base));
+    }
+    spv::Id threshold = builder_->createVectorExtractDynamic(
+        builder_->makeCompositeConstant(type_float4_, id_vector_temp_),
+        type_float_, samples_as_pixels_sample_index);
+    threshold = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float_, threshold,
+        builder_->createNoContractionBinOp(
+            spv::OpFMul, type_float_, threshold_offset,
+            builder_->makeFloatConstant(-1.0f / 16.0f)));
+    spv::Id sample_fails = builder_->createUnaryOp(
+        spv::OpLogicalNot, type_bool_,
+        builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_, alpha,
+                              threshold));
+    SpirvBuilder::IfBuilder sample_discard_if(
+        sample_fails, spv::SelectionControlDontFlattenMask, *builder_);
+    builder_->createNoResultOp(spv::OpKill);
+    sample_discard_if.makeEndIf(false);
+    builder_->createBranch(&block_alpha_to_mask_merge);
+    builder_->setBuildPoint(&block_alpha_to_mask_merge);
+    return;
+  }
+
   // Load MSAA sample count to determine which mode to use.
   // 0 = 1x, 1 = 2x, 2 = 4x
   spv::Id msaa_samples = LoadMsaaSamplesFromFlags();
@@ -4485,20 +4515,6 @@ void SpirvShaderTranslator::FSI_AlphaToMask() {
 
   // Write coverage to gl_SampleMask and discard if zero (FBO mode only).
   if (!edram_fragment_shader_interlock_) {
-    if (samples_as_pixels) {
-      // Extract this 2x2 subpixel's coverage bit when 4x MSAA is active.
-      spv::Id is_4x_samples_as_pixels = builder_->createBinOp(
-          spv::OpIEqual, type_bool_, msaa_samples,
-          builder_->makeUintConstant(2));
-      spv::Id pixel_sample_covered = builder_->createBinOp(
-          spv::OpBitwiseAnd, type_uint_,
-          builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
-                                coverage_final, samples_as_pixels_sample_index),
-          builder_->makeUintConstant(1));
-      coverage_final = builder_->createTriOp(
-          spv::OpSelect, type_uint_, is_4x_samples_as_pixels,
-          pixel_sample_covered, coverage_final);
-    }
     // Write to gl_SampleMask[0] when present (non-2x2 FBO path).
     if (output_fragment_sample_mask_ != spv::NoResult) {
       id_vector_temp_.clear();

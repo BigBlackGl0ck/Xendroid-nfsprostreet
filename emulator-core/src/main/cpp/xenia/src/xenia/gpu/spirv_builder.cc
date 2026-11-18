@@ -20,7 +20,7 @@ spv::Id SpirvBuilder::createTriOp(spv::Op op_code, spv::Id type_id,
                                   spv::Id operand3) {
   if (op_code == spv::OpSelect && isVectorType(type_id) &&
       isScalarType(getTypeId(operand1)) &&
-      (rewrite_scalar_vector_select_ || getVersion() < spv::Spv_1_4)) {
+      (rewrite_scalar_vector_select_ || getSpvVersion() < spv::Spv_1_4)) {
     int num_components = getNumTypeComponents(type_id);
     spv::Id bool_vec_type = makeVectorType(makeBoolType(), num_components);
     bool is_const = isConstant(operand1);

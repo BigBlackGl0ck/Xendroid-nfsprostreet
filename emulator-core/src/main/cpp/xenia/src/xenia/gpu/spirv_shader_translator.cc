@@ -357,7 +357,17 @@ SpirvShaderTranslator::Features::Features(bool all)
       rounding_mode_rte_float32(all),
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all),
-      fragment_shader_barycentric(all) {}
+      fragment_shader_barycentric(all),
+      samples_as_pixels_coarse(all) {}
+
+bool SpirvShaderTranslator::IsDrawSamplesAsPixelsCoarse() const {
+  return IsDrawSamplesAsPixels() && features_.samples_as_pixels_coarse &&
+         IsSamplesAsPixelsCoarseAllowed(
+             GetSpirvShaderModification(), current_shader().writes_depth(),
+             current_shader().kills_pixels() ||
+                 current_shader().memexport_eM_written() != 0,
+             cvars::vulkan_fable2_float24_depth);
+}
 
 SpirvShaderTranslator::Features::Features(
     const ui::vulkan::VulkanDevice* const vulkan_device)
@@ -391,7 +401,9 @@ SpirvShaderTranslator::Features::Features(
                                   VK_DRIVER_ID_MOLTENVK),
       mali_cap_spirv_13(vulkan_device->properties().maliCapSpirv13),
       rewrite_scalar_select(vulkan_device->properties().maliRewriteScalarSelect),
-      buffer_device_address(vulkan_device->properties().bufferDeviceAddress) {
+      buffer_device_address(vulkan_device->properties().bufferDeviceAddress),
+      samples_as_pixels_coarse(
+          vulkan_device->properties().pipelineFragmentShadingRate) {
   // Check for SPIR-V version override from CVAR.
   const std::string& override_version = cvars::spirv_version_override;
   if (override_version == "1.0") {
@@ -626,7 +638,7 @@ void SpirvShaderTranslator::StartTranslation() {
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);
   if (use_shared_memory_bda_) {
-    builder_->addCapability(spv::CapabilityPhysicalStorageBufferAddresses);
+    builder_->addCapability(spv::Capability::PhysicalStorageBufferAddresses);
     if (features_.spirv_version < spv::Spv_1_5) {
       builder_->addExtension("SPV_KHR_physical_storage_buffer");
     }
@@ -640,7 +652,7 @@ void SpirvShaderTranslator::StartTranslation() {
   }
   ext_inst_glsl_std_450_ = builder_->import("GLSL.std.450");
   builder_->setMemoryModel(use_shared_memory_bda_
-                               ? spv::AddressingModelPhysicalStorageBuffer64
+                               ? spv::AddressingModel::PhysicalStorageBuffer64
                                : spv::AddressingModelLogical,
                            spv::MemoryModelGLSL450);
   builder_->setSource(spv::SourceLanguageUnknown, 0);
@@ -985,15 +997,13 @@ void SpirvShaderTranslator::StartTranslation() {
       builder_->addMemberName(type_bda_uint_struct_, 0, "word");
       builder_->addMemberDecoration(type_bda_uint_struct_, 0,
                                     spv::DecorationOffset, 0);
-      builder_->addMemberDecoration(type_bda_uint_struct_, 0,
-                                    spv::DecorationRestrict);
       if (!memexport_used) {
         builder_->addMemberDecoration(type_bda_uint_struct_, 0,
                                       spv::DecorationNonWritable);
       }
       builder_->addDecoration(type_bda_uint_struct_, spv::DecorationBlock);
       type_bda_uint_ptr_ = builder_->makePointer(
-          spv::StorageClassPhysicalStorageBuffer, type_bda_uint_struct_);
+          spv::StorageClass::PhysicalStorageBuffer, type_bda_uint_struct_);
       id_vector_temp_.clear();
       id_vector_temp_.push_back(type_uint_);
       id_vector_temp_.push_back(type_uint_);
@@ -5546,18 +5556,16 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(
         builder_->createCompositeConstruct(type_uint2_, id_vector_temp_);
     spv::Id bda_struct_ptr = builder_->createUnaryOp(
         spv::OpBitcast, type_bda_uint_ptr_, addr_uvec2);
-    // DecorationAliasedPointer (5356) required by VUID-StandaloneSpirv-04708.
-    builder_->addDecoration(bda_struct_ptr,
-                            static_cast<spv::Decoration>(5356));
     id_vector_temp_.clear();
     id_vector_temp_.push_back(const_int_0_);
     spv::Id bda_word_ptr = builder_->createAccessChain(
-        spv::StorageClassPhysicalStorageBuffer, bda_struct_ptr,
+        spv::StorageClass::PhysicalStorageBuffer, bda_struct_ptr,
         id_vector_temp_);
     auto load_op = std::make_unique<spv::Instruction>(
         builder_->getUniqueId(), type_uint_, spv::OpLoad);
     load_op->addIdOperand(bda_word_ptr);
-    load_op->addImmediateOperand(spv::MemoryAccessAlignedMask);
+    load_op->addImmediateOperand(
+        static_cast<unsigned int>(spv::MemoryAccessMask::Aligned));
     load_op->addImmediateOperand(4);
     spv::Id loaded_id = load_op->getResultId();
     builder_->getBuildPoint()->addInstruction(std::move(load_op));
@@ -5674,13 +5682,10 @@ void SpirvShaderTranslator::StoreUint32ToSharedMemory(
         builder_->createCompositeConstruct(type_uint2_, id_vector_temp_);
     spv::Id bda_struct_ptr = builder_->createUnaryOp(
         spv::OpBitcast, type_bda_uint_ptr_, addr_uvec2);
-    // DecorationAliasedPointer (5356) required by VUID-StandaloneSpirv-04708.
-    builder_->addDecoration(bda_struct_ptr,
-                            static_cast<spv::Decoration>(5356));
     id_vector_temp_.clear();
     id_vector_temp_.push_back(const_int_0_);
     spv::Id bda_word_ptr = builder_->createAccessChain(
-        spv::StorageClassPhysicalStorageBuffer, bda_struct_ptr,
+        spv::StorageClass::PhysicalStorageBuffer, bda_struct_ptr,
         id_vector_temp_);
     if (replace_mask != spv::NoResult) {
       spv::Id const_scope_device = builder_->makeUintConstant(
@@ -5695,7 +5700,8 @@ void SpirvShaderTranslator::StoreUint32ToSharedMemory(
       auto store_op = std::make_unique<spv::Instruction>(spv::OpStore);
       store_op->addIdOperand(bda_word_ptr);
       store_op->addIdOperand(value);
-      store_op->addImmediateOperand(spv::MemoryAccessAlignedMask);
+      store_op->addImmediateOperand(
+          static_cast<unsigned int>(spv::MemoryAccessMask::Aligned));
       store_op->addImmediateOperand(4);
       builder_->getBuildPoint()->addInstruction(std::move(store_op));
     }

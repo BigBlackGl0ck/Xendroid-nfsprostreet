@@ -633,22 +633,24 @@ class CommandProcessor {
   // VIZ_QUERY (64 visibility IDs, adapted from xenia-edge 692cd59cf).
   static constexpr uint64_t kInvalidVIZGeneration = 0;
   static constexpr uint32_t kVIZQueryCount = 64;
-  // ReportHandles with bit 63 set encode (id in bits 56..61, generation in
-  // bits 0..55) so VIZ segments can share backend query resolve plumbing.
-  static constexpr ReportHandle kVIZReportHandleBit = UINT64_C(1) << 63;
+  // 32-bit ReportHandles with bit 31 set encode (id in bits 25..30, non-zero
+  // 25-bit generation in bits 0..24) so VIZ segments can share backend query
+  // resolve plumbing without widening ReportHandle.
+  static constexpr ReportHandle kVIZReportHandleBit = UINT32_C(1) << 31;
+  static constexpr uint32_t kVIZGenerationMask = (UINT32_C(1) << 25) - 1;
   static constexpr bool IsVIZReportHandle(ReportHandle handle) {
     return (handle & kVIZReportHandleBit) != 0;
   }
   static constexpr ReportHandle MakeVIZReportHandle(uint32_t id,
                                                     uint64_t generation) {
-    return kVIZReportHandleBit | (uint64_t(id & 0x3Fu) << 56) |
-           (generation & ((UINT64_C(1) << 56) - 1));
+    return kVIZReportHandleBit | ((id & 0x3Fu) << 25) |
+           (uint32_t(generation) & kVIZGenerationMask);
   }
   static constexpr uint32_t GetVIZIdFromHandle(ReportHandle handle) {
-    return uint32_t((handle >> 56) & 0x3Fu);
+    return (handle >> 25) & 0x3Fu;
   }
   static constexpr uint64_t GetVIZGenerationFromHandle(ReportHandle handle) {
-    return handle & ((UINT64_C(1) << 56) - 1);
+    return uint64_t(handle & kVIZGenerationMask);
   }
 
   struct VIZQuery {
@@ -770,6 +772,8 @@ class CommandProcessor {
   // VIZ_QUERY lifecycle and conditional draw preparation.
   void BeginVIZQuery(uint32_t id);
   void EndVIZQuery(uint32_t id);
+  void RecordVIZQuerySegment(uint32_t id, uint64_t generation,
+                             uint64_t submission);
   void OnVIZSurveyDraw(bool measured);
   void OnVIZQueryResolved(uint32_t id, uint64_t generation, bool visible);
   bool PrepareVIZDraw(uint32_t token);
@@ -791,6 +795,7 @@ class CommandProcessor {
   void PerformCompletedHeldSignals();
   void SubmitHeldSignals();
   void AwaitHeldSignalsWriting(uint32_t physical_address);
+  void AwaitHeldSignalsAndMemexport();
   void PerformHeldSignals(size_t await_count);
   bool has_held_guest_signals() const { return !held_guest_signals_.empty(); }
   virtual uint64_t TakeMemexportSignalSubmission() { return 0; }
