@@ -193,6 +193,8 @@ void Clock::SetGuestSystemTime(uint64_t system_time) {
   guest_system_time_base_ = system_time - guest_system_time_offset;
 }
 
+void Clock::HoldGuestTime(bool hold) { (void)hold; }
+
 uint32_t Clock::ScaleGuestDurationMillis(uint32_t guest_ms) {
   if (cvars::clock_no_scaling) {
     return guest_ms;
