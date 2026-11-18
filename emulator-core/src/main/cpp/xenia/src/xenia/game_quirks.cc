@@ -2,14 +2,46 @@
 #include "xenia/game_quirks.h"
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <variant>
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/platform.h"
+
+#if XE_PLATFORM_xendroid || XE_PLATFORM_ANDROID
+#include <unistd.h>
+DECLARE_string(vulkan_lib_path);
+#endif
 
 namespace xe {
 namespace game_quirks {
+
+namespace {
+
+bool IsTurnipAdreno750OrNewer() {
+#if XE_PLATFORM_xendroid || XE_PLATFORM_ANDROID
+  if (cvars::vulkan_lib_path.empty() || access("/dev/kgsl-3d0", F_OK) != 0) {
+    return false;
+  }
+  char gpu_model[64] = {};
+  if (FILE* f = std::fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r")) {
+    if (!std::fgets(gpu_model, sizeof(gpu_model), f)) {
+      gpu_model[0] = '\0';
+    }
+    std::fclose(f);
+  }
+  const char* digits = std::strpbrk(gpu_model, "0123456789");
+  return digits && std::atoi(digits) >= 750;
+#else
+  return false;
+#endif
+}
+
+}  // namespace
 
 using QuirkValue = std::variant<bool, int64_t, double, const char*>;
 
@@ -457,6 +489,45 @@ static const Quirk kQuirks[] = {
      "4x draws with simple pixel shaders into the 1x surface"},
     {0x4D53085B, "vulkan_samples_as_pixels_coarse", true,
      "4x draws with textures into the 1x surface, once per 2x2 pixels"},
+    {0x4D53085B, "vulkan_msaa_single_sample_storage", false,
+     "per-sample data in 4x surfaces"},
+    // Fable II: terrain alpha-blended layers rely on exact 20e4 float24 depth
+    // quantization in the pixel shader to avoid transparent/missing ground.
+    {0x4D5307F1, "depth_float24_convert_in_pixel_shader", true,
+     "float24 depth quantization prevents transparent terrain"},
+    // Spider-Man titles: screen-space / post-FX quads outside [0, 1] clip Z
+    // require depth clamping rather than near/far clipping.
+    {0x4156081C, "vulkan_depth_clamp_without_depth", true,
+     "Spider-Man: Web of Shadows screen-space draws outside depth range"},
+    {0x4156081C, "force_depth_clamp", true,
+     "Spider-Man: Web of Shadows depth clamp"},
+    {0x41560878, "vulkan_depth_clamp_without_depth", true,
+     "Spider-Man: Shattered Dimensions screen-space draws outside depth range"},
+    {0x41560878, "force_depth_clamp", true,
+     "Spider-Man: Shattered Dimensions depth clamp"},
+    {0x415608B1, "vulkan_depth_clamp_without_depth", true,
+     "Spider-Man: Edge of Time screen-space draws outside depth range"},
+    {0x415608B1, "force_depth_clamp", true,
+     "Spider-Man: Edge of Time depth clamp"},
+    // Peter Jackson's King Kong: inline APC delivery inside synchronous file
+    // reads deadlocks the audio/streaming worker.
+    {0x555307D3, "file_read_no_apc_inline", true,
+     "prevent inline APC delivery freeze during file reads"},
+    // WWE 2K14: ranged physical allocations must start at the requested low
+    // bound without the 4 KiB offset or match start crashes.
+    {0x545408B2, "ignore_offset_for_ranged_allocations", true,
+     "crash as a match starts"},
+    // Battlefield 2: Modern Combat: reloads evicted EDRAM depth and uploads
+    // from pages marked no-access.
+    {0x454107DB, "depth_float24_convert_in_pixel_shader", true,
+     "black flickering ground polygons"},
+    {0x454107DB, "gpu_allow_invalid_upload_range", true,
+     "black flickering ground polygons"},
+    // Dead or Alive Xtreme 2: CPU reads back pages written by GPU resolves.
+    {0x544307D2, "clear_memory_page_state", true,
+     "garbled character select and intro"},
+    // FIFA 16: stadium shadow mask readback requires fast resolve copy to RAM.
+    {0x454109EE, "readback_resolve", "fast", "half of the pitch black"},
     // Naruto: Rise of a Ninja: its worker thread 0x18 starts (8265BB68) by
     // calling the routine at +0xEC of its object. When it ran on its
     // creator's CPU right after its creation, the object held the thread's id
@@ -476,6 +547,14 @@ static const Quirk kQuirks[] = {
 // Same path/priority as a per-game config file.
 static bool ApplyOne(const Quirk& quirk) {
   if (!cvar::ConfigVars) {
+    return false;
+  }
+  if (std::strcmp(quirk.cvar, "vulkan_texture_load_to_image") == 0 &&
+      std::holds_alternative<bool>(quirk.value) && std::get<bool>(quirk.value) &&
+      !IsTurnipAdreno750OrNewer()) {
+    XELOGI("Skipping game quirk '{}' for {:08X}: preserving AFBC/UBWC outside "
+           "Turnip Adreno >= 750",
+           quirk.cvar, quirk.title_id);
     return false;
   }
   auto it = cvar::ConfigVars->find(quirk.cvar);

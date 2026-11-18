@@ -125,16 +125,26 @@ void test_a64_lse_source_guard(const char* a64_dir_path) {
     std::string whole((std::istreambuf_iterator<char>(in)),
                       std::istreambuf_iterator<char>());
 
-    if (entry.path().filename() == "a64_seq_memory.cc") {
-      auto pos = whole.find("EmitNativeStoreConditional(");
-      expect(pos != std::string::npos,
-             "EmitNativeStoreConditional not found in a64_seq_memory.cc");
+    if (entry.path().filename() == "a64_backend.cc") {
+      auto pos = whole.find("EmitReservedStoreHelper(");
       if (pos != std::string::npos) {
         found_sc_fn = true;
         auto end = whole.find("\n}\n", pos);
         std::string fn_body = whole.substr(pos, end - pos);
-        // Count kA64EmitLSE checks inside EmitNativeStoreConditional: must
-        // guard both the fallback CAS and the sc_stored generation bump.
+        expect(fn_body.find("IsFeatureEnabled(kA64EmitLSE)") !=
+                   std::string::npos,
+               "EmitReservedStoreHelper must check kA64EmitLSE");
+        expect(fn_body.find("ldaxr(") != std::string::npos &&
+                   fn_body.find("stlxr(") != std::string::npos,
+               "EmitReservedStoreHelper missing ARMv8.0 LL/SC fallback");
+      }
+    }
+    if (entry.path().filename() == "a64_seq_memory.cc") {
+      auto pos = whole.find("EmitNativeStoreConditional(");
+      if (pos != std::string::npos) {
+        found_sc_fn = true;
+        auto end = whole.find("\n}\n", pos);
+        std::string fn_body = whole.substr(pos, end - pos);
         size_t guards = 0;
         for (size_t p = 0;
              (p = fn_body.find("IsFeatureEnabled(kA64EmitLSE)", p)) !=
@@ -187,13 +197,18 @@ void test_a64_lse_source_guard(const char* a64_dir_path) {
       if (!std::regex_search(lines[i], lse_call)) continue;
       ++lse_sites;
       bool guarded = false;
-      const size_t lookback = (i > 12) ? (i - 12) : 0;
+      const size_t lookback = (i > 48) ? (i - 48) : 0;
+      bool in_lse_branch = false;
       for (size_t j = lookback; j <= i; ++j) {
-        if (lines[j].find("kA64EmitLSE") != std::string::npos) {
-          guarded = true;
-          break;
+        if (lines[j].find("kA64EmitLSE") != std::string::npos ||
+            lines[j].find("if (lse)") != std::string::npos) {
+          in_lse_branch = true;
+        }
+        if (in_lse_branch && lines[j].find("} else {") != std::string::npos) {
+          in_lse_branch = false;
         }
       }
+      guarded = in_lse_branch;
       if (!guarded) {
         std::fprintf(stderr, "Unguarded LSE call at %s:%zu: %s\n",
                      entry.path().filename().string().c_str(), i + 1,

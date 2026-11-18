@@ -461,8 +461,10 @@ class PosixConditionBase {
 
   // The shared condvar is a notify_all, so poking it for an object nobody
   // multi-waits on wakes every parked thread to re-check handles it does not
-  // care about.
-  void NotifyAll() {
+  // care about. When |unlock_first| is provided, mutex_ is released before
+  // poking multi-waiters so woken WaitMultiple threads do not immediately hit
+  // a contended trylock on the signaling thread.
+  void NotifyAll(std::unique_lock<std::mutex>* unlock_first = nullptr) {
     // bionic's pthread_cond_broadcast issues the futex syscall even with no
     // sleeper. Under the cooperative scheduler guest waits are fibers, so
     // nearly every signal is uncontended and paid a syscall for nothing.
@@ -470,7 +472,12 @@ class PosixConditionBase {
     if (parked_waiters_ != 0) {
       cond_.notify_all();
     }
-    if (multi_wait_refs_.load(std::memory_order_acquire) != 0) {
+    const bool poke_multi =
+        multi_wait_refs_.load(std::memory_order_acquire) != 0;
+    if (unlock_first && unlock_first->owns_lock()) {
+      unlock_first->unlock();
+    }
+    if (poke_multi) {
       PokeMultiWaiters();
     }
   }
@@ -560,6 +567,7 @@ class PosixConditionBase {
       std::vector<std::unique_lock<std::mutex>> locks;
       locks.reserve(handles.size());
       bool all_locked = true;
+      PosixConditionBase* contended = nullptr;
 
       for (size_t i = 0; i < handles.size(); ++i) {
         if (duplicate[i]) {
@@ -569,6 +577,7 @@ class PosixConditionBase {
         // macOS: no robust mutex support.
         std::unique_lock<std::mutex> lk(handles[i]->mutex_, std::try_to_lock);
         if (!lk.owns_lock()) {
+          contended = handles[i];
           all_locked = false;
           break;
         }
@@ -585,6 +594,7 @@ class PosixConditionBase {
           }
           locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
         } else {
+          contended = handles[i];
           all_locked = false;
           break;
         }
@@ -592,6 +602,7 @@ class PosixConditionBase {
         if (result == 0) {
           locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
         } else {
+          contended = handles[i];
           all_locked = false;
           break;
         }
@@ -599,10 +610,30 @@ class PosixConditionBase {
 #endif
       }
 
-      // If we couldn't acquire all locks, release what we have and retry.
+      // If we couldn't acquire all locks, release partial locks and block on
+      // the contended mutex instead of spinning on sched_yield(), preventing
+      // priority inversion when a high-priority audio/worker thread shares a
+      // core with the lock holder.
       if (!all_locked) {
         locks.clear();
-        std::this_thread::yield();
+        if (contended && timeout.count() > 0 &&
+            std::chrono::steady_clock::now() < end_time) {
+#if XE_PLATFORM_MAC || XE_PLATFORM_xendroid
+          std::lock_guard<std::mutex> wait_holder(contended->mutex_);
+#else
+          auto contended_native =
+              static_cast<pthread_mutex_t*>(contended->mutex_.native_handle());
+          int lock_res = pthread_mutex_lock(contended_native);
+          if (lock_res == EOWNERDEAD) {
+            pthread_mutex_consistent(contended_native);
+            pthread_mutex_unlock(contended_native);
+          } else if (lock_res == 0) {
+            pthread_mutex_unlock(contended_native);
+          }
+#endif
+        } else {
+          std::this_thread::yield();
+        }
         continue;
       }
 
@@ -726,17 +757,18 @@ class PosixCondition<Event> : public PosixConditionBase {
   // SetEvent.
   bool Signal() override {
     auto lock = GuardedLock();
+    pulse_unclaimed_ = false;
     if (manual_reset_ || !AutoResetEventHandoff()) {
       signal_ = true;
-      NotifyAll();
+      NotifyAll(&lock);
       return true;
     }
-    if (ReleaseOneWaiterLocked()) {
+    if (ReleaseOneWaiterLocked(&lock)) {
       return true;
     }
     // No waiter: latch one idempotent token.
     signal_ = true;
-    NotifyAll();
+    NotifyAll(&lock);
     return true;
   }
 
@@ -744,19 +776,26 @@ class PosixCondition<Event> : public PosixConditionBase {
   void Reset() {
     auto lock = GuardedLock();
     signal_ = false;
+    pulse_unclaimed_ = false;
   }
 
   // Releases the callers already waiting, only one of them for an auto-reset
-  // event, and leaves the event reset.
+  // event, and leaves the event reset without sleeping under caller locks.
   void Pulse() {
     auto lock = GuardedLock();
     signal_ = false;
-    if (!manual_reset_ && AutoResetEventHandoff() && ReleaseOneWaiterLocked()) {
+    if (!manual_reset_ && AutoResetEventHandoff() &&
+        ReleaseOneWaiterLocked(&lock)) {
+      return;
+    }
+    if (!manual_reset_ && parked_waiters_ == 0 &&
+        multi_wait_refs_.load(std::memory_order_acquire) == 0) {
+      pulse_unclaimed_ = false;
       return;
     }
     pulse_count_.fetch_add(1, std::memory_order_release);
     pulse_unclaimed_ = true;
-    NotifyAll();
+    NotifyAll(&lock);
   }
 
   // NtQueryEvent. EVENT_TYPE: NotificationEvent = 0, SynchronizationEvent = 1.
@@ -803,11 +842,12 @@ class PosixCondition<Event> : public PosixConditionBase {
 #endif
   }
 
-  bool ReleaseOneWaiterLocked() {
+  bool ReleaseOneWaiterLocked(
+      std::unique_lock<std::mutex>* unlock_first = nullptr) {
     for (Waiter* w = head_; w != nullptr; w = w->next) {
       if (!w->released) {
         w->released = true;
-        NotifyAll();
+        NotifyAll(unlock_first);
         return true;
       }
     }
@@ -921,7 +961,7 @@ class PosixCondition<Event> : public PosixConditionBase {
     return pulse_count_.load(std::memory_order_acquire);
   }
   [[nodiscard]] bool pulse_unclaimed() const override {
-    return manual_reset_ || pulse_unclaimed_;
+    return manual_reset_ || (pulse_unclaimed_ && head_ == nullptr);
   }
   void post_execution() override {
     if (manual_reset_) {
@@ -935,11 +975,11 @@ class PosixCondition<Event> : public PosixConditionBase {
   }
   bool signal_;
   const bool manual_reset_;
-  Waiter* head_ = nullptr;
-  Waiter* tail_ = nullptr;
   // Written under mutex_, atomic for the multi-wait snapshot taken without it.
   std::atomic<uint64_t> pulse_count_{0};
   bool pulse_unclaimed_ = false;
+  Waiter* head_ = nullptr;
+  Waiter* tail_ = nullptr;
 };
 
 template <>
@@ -972,7 +1012,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
       *out_previous_count = count_;
     }
     count_ += release_count;
-    NotifyAll();
+    NotifyAll(&lock);
     return true;
   }
 
@@ -1071,7 +1111,7 @@ class PosixCondition<Mutant> final : public PosixConditionBase {
       --count_;
       // Free to be acquired by another thread
       if (count_ == 0) {
-        NotifyAll();
+        NotifyAll(&lock);
       }
       return true;
     }
@@ -1103,9 +1143,9 @@ class PosixCondition<Timer> final : public PosixConditionBase {
   ~PosixCondition() override { Cancel(); }
 
   bool Signal() override {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     signal_ = true;
-    NotifyAll();
+    NotifyAll(&lock);
     return true;
   }
 
@@ -2126,7 +2166,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   std::unique_lock lock(thread->handle_.mutex_);
   thread->handle_.exit_code_ = 0;
   thread->handle_.signaled_ = true;
-  thread->handle_.NotifyAll();
+  thread->handle_.NotifyAll(&lock);
 
   current_thread_ = nullptr;
   return nullptr;

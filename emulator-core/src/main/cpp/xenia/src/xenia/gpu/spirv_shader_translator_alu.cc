@@ -29,23 +29,56 @@ namespace gpu {
 spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value,
                                                       spv::Id operand_0_abs,
                                                       spv::Id operand_1_abs) {
-  if (math_relaxations_ & kMathRelaxationMultiplyZero) {
+  if ((math_relaxations_ & kMathRelaxationMultiplyZero) ||
+      !current_alu_mul_taint_) {
     return value;
   }
   EnsureBuildPointAvailable();
   int num_components = builder_->getNumComponents(value);
   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
   assert_true(builder_->getNumComponents(operand_1_abs) == num_components);
+  spv::Id type_float_vec = type_float_vectors_[num_components - 1];
+  spv::Id type_bool_vec = type_bool_vectors_[num_components - 1];
+  spv::Id const_zero_float = const_float_vectors_0_[num_components - 1];
+  if (current_alu_mul_taint_ != 3) {
+    // One operand is proven finite, so only it being 0 can meet an Inf/NaN in
+    // the other operand.
+    spv::Id finite_operand_abs =
+        current_alu_mul_taint_ == 1 ? operand_1_abs : operand_0_abs;
+    if (!cvars::spirv_multiply_zero_test_on_bits) {
+      return builder_->createTriOp(
+          spv::OpSelect, type_float_vec,
+          builder_->createBinOp(spv::OpFOrdEqual, type_bool_vec,
+                                finite_operand_abs, const_zero_float),
+          const_zero_float, value);
+    }
+    spv::Id type_uint_vector = type_uint_vectors_[num_components - 1];
+    spv::Id const_uint_zero = builder_->makeUintConstant(0);
+    if (num_components > 1) {
+      std::vector<spv::Id> components(size_t(num_components), const_uint_zero);
+      const_uint_zero =
+          builder_->makeCompositeConstant(type_uint_vector, components);
+    }
+    return builder_->createTriOp(
+        spv::OpSelect, type_float_vec,
+        builder_->createBinOp(spv::OpIEqual, type_bool_vec,
+                              builder_->createUnaryOp(spv::OpBitcast,
+                                                      type_uint_vector,
+                                                      finite_operand_abs),
+                              const_uint_zero),
+        const_zero_float, value);
+  }
   if (!cvars::spirv_multiply_zero_test_on_bits) {
     return builder_->createTriOp(
-        spv::OpSelect, type_float_,
+        spv::OpSelect, type_float_vec,
         builder_->createBinOp(
-            spv::OpFOrdEqual, type_bool_vectors_[num_components - 1],
-            builder_->createBinBuiltinCall(
-                type_float_vectors_[num_components - 1], ext_inst_glsl_std_450_,
-                GLSLstd450NMin, operand_0_abs, operand_1_abs),
-            const_float_vectors_0_[num_components - 1]),
-        const_float_vectors_0_[num_components - 1], value);
+            spv::OpFOrdEqual, type_bool_vec,
+            builder_->createBinBuiltinCall(type_float_vec,
+                                           ext_inst_glsl_std_450_,
+                                           GLSLstd450NMin, operand_0_abs,
+                                           operand_1_abs),
+            const_zero_float),
+        const_zero_float, value);
   }
   // Equivalent to min(|a|, |b|) == 0.0 - the operands are already absolute, so
   // their bit patterns order like their values. See the cvar for why.
@@ -64,11 +97,10 @@ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value,
         builder_->makeCompositeConstant(type_uint_vector, components);
   }
   return builder_->createTriOp(
-      spv::OpSelect, type_float_,
-      builder_->createBinOp(spv::OpIEqual,
-                            type_bool_vectors_[num_components - 1], min_bits,
+      spv::OpSelect, type_float_vec,
+      builder_->createBinOp(spv::OpIEqual, type_bool_vec, min_bits,
                             const_uint_zero),
-      const_float_vectors_0_[num_components - 1], value);
+      const_zero_float, value);
 }
 
 spv::Id SpirvShaderTranslator::ScalarEstimate(ScalarEstimateOp op,
@@ -857,6 +889,9 @@ void SpirvShaderTranslator::ProcessAluInstruction(
 
   const Shader& shader = current_shader();
   uint32_t instruction_address = current_instruction_address();
+  uint8_t mul_taint = instruction_address < mul_taint_.size()
+                          ? mul_taint_[instruction_address]
+                          : 0x0F;
 
   // Whether the instruction has changed the predicate, and it needs to be
   // checked again later.
@@ -865,6 +900,7 @@ void SpirvShaderTranslator::ProcessAluInstruction(
       shader.GetAluVectorResultRoundingSensitiveComponents(instruction_address);
   alu_op_result_rounding_sensitive_ =
       alu_vector_rounding_sensitive_components_ != 0;
+  current_alu_mul_taint_ = mul_taint & 0x03;
   spv::Id vector_result = ProcessVectorAluOperation(
       instr, memexport_eM_potentially_written_before, predicate_written_vector);
 
@@ -872,6 +908,7 @@ void SpirvShaderTranslator::ProcessAluInstruction(
   alu_vector_rounding_sensitive_components_ = 0;
   alu_op_result_rounding_sensitive_ =
       shader.IsAluScalarResultRoundingSensitive(instruction_address);
+  current_alu_mul_taint_ = (mul_taint >> 2) & 0x03;
   spv::Id scalar_result = ProcessScalarAluOperation(
       instr, memexport_eM_potentially_written_before, predicate_written_scalar);
   if (scalar_result != spv::NoResult) {
@@ -1016,8 +1053,9 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
           used_result_components &
           ~instr.vector_operands[0].GetIdenticalComponents(
               instr.vector_operands[1]);
-      // Like ZeroIfAnyOperandIsZero, skipped with the multiply-zero relaxation.
-      if (multiplicands_different &&
+      // Like ZeroIfAnyOperandIsZero, skipped with the multiply-zero relaxation
+      // or when both operands are proven finite by AnalyzeShaderNonFiniteOperands.
+      if (multiplicands_different && current_alu_mul_taint_ &&
           !(math_relaxations_ & kMathRelaxationMultiplyZero)) {
         // Shader Model 3: +0 or denormal * anything = +-0.
         spv::Id different_operands[2] = {multiplicands[0], multiplicands[1]};
@@ -1056,43 +1094,14 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
           }
         }
         // Check if the different components in any of the operands are zero,
-        // even if the other is NaN - if min(|a|, |b|) is 0.
+        // even if the other is NaN - if min(|a|, |b|) is 0 (or single compare
+        // when one operand is proven finite).
         for (uint32_t i = 0; i < 2; ++i) {
           different_operands[i] = GetAbsoluteOperand(different_operands[i],
                                                      instr.vector_operands[i]);
         }
-        spv::Id different_zero;
-        if (cvars::spirv_multiply_zero_test_on_bits) {
-          // As in ZeroIfAnyOperandIsZero.
-          spv::Id different_uint_type = type_uint_vectors_[different_count - 1];
-          spv::Id different_zero_uint = builder_->makeUintConstant(0);
-          if (different_count > 1) {
-            std::vector<spv::Id> zero_components(size_t(different_count),
-                                                 different_zero_uint);
-            different_zero_uint = builder_->makeCompositeConstant(
-                different_uint_type, zero_components);
-          }
-          different_zero = builder_->createBinOp(
-              spv::OpIEqual, type_bool_vectors_[different_count - 1],
-              builder_->createBinBuiltinCall(
-                  different_uint_type, ext_inst_glsl_std_450_, GLSLstd450UMin,
-                  builder_->createUnaryOp(spv::OpBitcast, different_uint_type,
-                                          different_operands[0]),
-                  builder_->createUnaryOp(spv::OpBitcast, different_uint_type,
-                                          different_operands[1])),
-              different_zero_uint);
-        } else {
-          different_zero = builder_->createBinOp(
-              spv::OpFOrdEqual, type_bool_vectors_[different_count - 1],
-              builder_->createBinBuiltinCall(
-                  different_type, ext_inst_glsl_std_450_, GLSLstd450NMin,
-                  different_operands[0], different_operands[1]),
-              const_float_vectors_0_[different_count - 1]);
-        }
-        // Replace with +0.
-        different_result = builder_->createTriOp(
-            spv::OpSelect, different_type, different_zero,
-            const_float_vectors_0_[different_count - 1], different_result);
+        different_result = ZeroIfAnyOperandIsZero(
+            different_result, different_operands[0], different_operands[1]);
         // Insert the different components back to the result.
         if (multiplicands_different != used_result_components) {
           if (different_count > 1) {
@@ -1470,6 +1479,8 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
               ma_y_result[0] =
                   builder_->createTriOp(spv::OpSelect, type_float_, y_is_neg,
                                         operand_neg[2], operand[2]);
+            }
+            if (used_result_components & 0b1000) {
               // id = y < 0.0 ? 3.0 : 2.0
               ma_y_result[3] =
                   builder_->createTriOp(spv::OpSelect, type_float_, y_is_neg,

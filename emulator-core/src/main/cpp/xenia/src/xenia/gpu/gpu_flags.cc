@@ -309,3 +309,17 @@ DEFINE_bool(
     "may reach a vertex fetch index, the address register, a memory export "
     "or a floor, trunc or frc this way.",
     "GPU");
+
+DEFINE_bool(
+    texture_point_snap, false,
+    "Snap normalized point sampled 2D texture coordinates to texel centers. "
+    "Fixes texture seams in titles that use virtual textures, e.g. idTech 5, "
+    "but may cause rendering issues in other titles.",
+    "GPU");
+
+DEFINE_bool(
+    force_depth_clamp, false,
+    "Force depth clamping instead of near/far depth clipping when supported "
+    "by the host GPU, working around missing skyboxes or clipped viewmodels "
+    "in titles that push geometry slightly outside [0, 1] depth.",
+    "GPU");

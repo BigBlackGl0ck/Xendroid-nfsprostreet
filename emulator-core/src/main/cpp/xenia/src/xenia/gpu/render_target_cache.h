@@ -231,6 +231,10 @@ class RenderTargetCache {
   bool draw_samples_as_pixels_keep_vertical() const {
     return draw_samples_as_pixels_keep_vertical_;
   }
+  // vulkan_msaa_4x_as_2x2: resolve clears of 4x surfaces also target the 1x
+  // double-size key, so they don't take the range back to a 4x image.
+  void SetMsaa4xClearsAs2x2(bool enabled) { msaa_4x_clears_as_2x2_ = enabled; }
+  bool msaa_4x_clears_as_2x2() const { return msaa_4x_clears_as_2x2_; }
   // The sample count and the pitch (in tiles at 32bpp) of the render target
   // owning an EDRAM tile now - false if none does.
   bool GetEdramTileOwner(uint32_t tile, xenos::MsaaSamples& msaa_samples_out,
@@ -820,6 +824,7 @@ class RenderTargetCache {
   uint32_t draw_resolution_scale_y_;
   bool draw_samples_as_pixels_ = false;
   bool draw_samples_as_pixels_keep_vertical_ = false;
+  bool msaa_4x_clears_as_2x2_ = false;
   bool draw_pixel_shader_kills_ = false;
   bool draw_has_pixel_shader_ = true;
   uint64_t overwritten_transfers_cut_ = 0;
