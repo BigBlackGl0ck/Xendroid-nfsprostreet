@@ -146,9 +146,9 @@ uint64_t GuestSpirvShaderCache::GetPixelShaderModification(
     // without resolution scaling, which the threshold needs, it means the
     // samples of a 4x draw are pixels here, for the position it reads.
     modification.pixel.resolution_scale_native =
-        uint32_t(render_target_cache_.IsDrawScaleNative() ||
-                 (param_gen_pos < xenos::kMaxInterpolators &&
-                  render_target_cache_.draw_samples_as_pixels()));
+        uint32_t(render_target_cache_.IsDrawResolutionScaled()
+                     ? render_target_cache_.IsDrawScaleNative()
+                     : render_target_cache_.draw_samples_as_pixels());
 
     using DepthStencilMode =
         SpirvShaderTranslator::Modification::DepthStencilMode;

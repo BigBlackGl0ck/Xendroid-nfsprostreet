@@ -11,6 +11,7 @@
 #include <charconv>
 #include <functional>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
@@ -25,6 +26,13 @@
 #include "xenia/kernel/xthread.h"
 #include "xenia/vfs/device.h"
 #include "xenia/xbox.h"
+
+DEFINE_bool(
+    file_read_no_apc_inline, false,
+    "Do not force asynchronous file reads with APC completion routines to "
+    "complete inline when issued from inside a user APC callback (fixes "
+    "streaming freezes in titles such as Peter Jackson's King Kong).",
+    "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -99,16 +107,21 @@ static X_STATUS SubmitRequest(const object_ref<XFile>& file,
                               uint32_t apc_routine, uint32_t apc_context,
                               X_IO_STATUS_BLOCK* status_block,
                               uint32_t status_block_address, bool pends,
-                              std::function<X_STATUS(uint32_t*)> transfer) {
+                              std::function<X_STATUS(uint32_t*)> transfer,
+                              bool is_write = false) {
   auto thread = retain_object(XThread::GetCurrentThread());
   // A completion routine upstream queues as a kernel APC (bit 0 clear) is a
   // user APC here. Pending a request issued from a user APC routine would
   // queue it after the delivery that issued the request had ended, for a title
   // that then only sleeps non-alertably (Cars chains its reads that way), so
-  // such a request completes inline.
+  // such a request completes inline unless disabled for titles (e.g. Peter
+  // Jackson's King Kong, 0x555307D3) whose streaming APC expects PENDING.
   auto* scheduler = kernel_state()->guest_scheduler();
-  if (pends && QueuesApc(apc_routine, apc_context) && !(apc_routine & 1) &&
-      thread->in_user_apc()) {
+  const bool disable_read_apc_inline =
+      !is_write && (cvars::file_read_no_apc_inline ||
+                    kernel_state()->title_id() == 0x555307D3u);
+  if (pends && !disable_read_apc_inline && QueuesApc(apc_routine, apc_context) &&
+      !(apc_routine & 1) && thread->in_user_apc()) {
     pends = false;
     scheduler->NoteFileRequest(GuestScheduler::FileRequestEvent::kApcInline);
   }
@@ -453,7 +466,8 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
             }
           }
           return status;
-        });
+        },
+        true);
   }
 
   return result;

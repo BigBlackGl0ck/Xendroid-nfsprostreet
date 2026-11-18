@@ -584,7 +584,7 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
     std::error_code remove_ec;
     std::filesystem::remove(dest_name, remove_ec);
     if (read_failed) {
-      return X_STATUS_INVALID_PARAMETER;
+      return X_STATUS_END_OF_FILE;
     }
     return write_errno == ENOSPC ? X_STATUS_DISK_FULL : X_STATUS_ACCESS_DENIED;
   }
