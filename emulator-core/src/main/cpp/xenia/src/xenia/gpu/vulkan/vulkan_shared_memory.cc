@@ -465,6 +465,7 @@ bool VulkanSharedMemory::TryInitializeZeroCopy() {
   }
   buffer_memory_.push_back(buffer_memory);
   zero_copy_ = true;
+  SetUnwatchSkipVerify(true);
   XELOGI("Shared memory: using zero-copy guest RAM aliasing");
   return true;
 }
@@ -513,6 +514,7 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
   }
   buffer_memory_.clear();
   zero_copy_ = false;
+  SetUnwatchSkipVerify(false);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
                                          host_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
@@ -945,17 +947,19 @@ bool VulkanSharedMemory::UploadRanges(
                      uint32_t(upload_buffer_size), false);
       command_processor_.NoteSharedMemoryUpload(upload_buffer_size);
 
+      uint32_t upload_buffer_pages =
+          uint32_t(upload_buffer_size >> page_size_log2());
+      uint8_t* guest_src =
+          memory().TranslatePhysical(upload_range_start << page_size_log2());
+      SetPageUploadHashes(upload_range_start, upload_buffer_pages, guest_src);
+      std::atomic_thread_fence(std::memory_order_acquire);
+
       if (upload_buffer_size < (1ULL << 32) && upload_buffer_size > 8192) {
-        memory::vastcpy(
-            upload_buffer_mapping,
-            memory().TranslatePhysical(upload_range_start << page_size_log2()),
-            static_cast<uint32_t>(upload_buffer_size));
+        memory::vastcpy(upload_buffer_mapping, guest_src,
+                        static_cast<uint32_t>(upload_buffer_size));
         swcache::WriteFence();
       } else {
-        std::memcpy(
-            upload_buffer_mapping,
-            memory().TranslatePhysical(upload_range_start << page_size_log2()),
-            upload_buffer_size);
+        std::memcpy(upload_buffer_mapping, guest_src, upload_buffer_size);
       }
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
@@ -970,8 +974,6 @@ bool VulkanSharedMemory::UploadRanges(
       upload_region.dstOffset =
           VkDeviceSize(upload_range_start << page_size_log2());
       upload_region.size = upload_buffer_size;
-      uint32_t upload_buffer_pages =
-          uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
     }
