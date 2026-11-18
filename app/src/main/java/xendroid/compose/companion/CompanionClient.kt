@@ -74,7 +74,7 @@ class CompanionClient private constructor(
                 override fun close() = tcpSocket.close()
             }
         },
-        abortPendingConnect = { runCatching { tcpSocket.close() } },
+        abortPendingConnect = { try { tcpSocket.close() } catch (_: IOException) {} },
         code = code,
         name = name,
         clientId = clientId,
