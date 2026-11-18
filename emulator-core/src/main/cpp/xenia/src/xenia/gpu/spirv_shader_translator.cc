@@ -134,7 +134,7 @@ DEFINE_int32(
     "the same position computed by different shaders may stop matching "
     "between passes (depth fighting).",
     "GPU");
-UPDATE_from_int32(spirv_vs_relaxed_math, 2026, 11, 18, 21, 0);
+UPDATE_from_int32(spirv_vs_relaxed_math, 2026, 11, 18, 22, 0);
 
 DEFINE_bool(
     spirv_texture_sign_branch, true,
@@ -190,7 +190,7 @@ DEFINE_bool(
     "gradient exponent biases (texture_gradient_exp_bias) keep the "
     "gradients. Read when shaders are translated (startup).",
     "GPU");
-UPDATE_from_bool(spirv_texture_implicit_lod, 2026, 11, 18, 21, false);
+UPDATE_from_bool(spirv_texture_implicit_lod, 2026, 11, 18, 23, false);
 
 DEFINE_bool(
     spirv_texture_exp_adjust_specialization, true,

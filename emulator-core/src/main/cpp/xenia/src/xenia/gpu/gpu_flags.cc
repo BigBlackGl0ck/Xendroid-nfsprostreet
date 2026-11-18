@@ -67,7 +67,7 @@ DEFINE_int32(
     "the guest CPU's write sooner. Read per wait "
     "(debug.xendroid.wrm_max_us on Android).",
     "GPU");
-UPDATE_from_int32(wait_reg_mem_backoff_max_us, 2026, 11, 18, 21, 0);
+UPDATE_from_int32(wait_reg_mem_backoff_max_us, 2026, 11, 18, 22, 0);
 
 DEFINE_uint32(
     framerate_limit, 60,

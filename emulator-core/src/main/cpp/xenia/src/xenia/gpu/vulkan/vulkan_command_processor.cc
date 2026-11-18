@@ -256,7 +256,7 @@ DEFINE_bool(
     "centers otherwise. Can be switched at runtime "
     "(debug.xendroid.samples_as_pixels_ps).",
     "GPU");
-UPDATE_from_bool(vulkan_samples_as_pixels_simple_ps, 2026, 11, 18, 21, false);
+UPDATE_from_bool(vulkan_samples_as_pixels_simple_ps, 2026, 11, 18, 22, false);
 
 DEFINE_bool(
     vulkan_samples_as_pixels_coarse, false,
@@ -456,7 +456,7 @@ DEFINE_bool(
     "right before it has exported. Can be switched at runtime "
     "(debug.xendroid.memexport_barriers).",
     "Vulkan");
-UPDATE_from_bool(vulkan_memexport_barriers_by_range, 2026, 11, 18, 21, false);
+UPDATE_from_bool(vulkan_memexport_barriers_by_range, 2026, 11, 18, 23, false);
 
 DEFINE_int32(
     vulkan_debug_extra_pass_breaks, 0,
