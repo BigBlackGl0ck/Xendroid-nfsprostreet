@@ -27,7 +27,13 @@ else
     cxx=("${CXX:-c++}")
     dl=(-ldl)   # dladdr/dl_iterate_phdr before glibc 2.34
 fi
-flags=(-std=c++20 -O1 -Wall -I "$cpp" -I "$cpp/xenia" -I "$cpp/xenia/src" -I "$test/stubs")
+# SSSE3 is not part of the x86-64 baseline, and conversion.h uses
+# _mm_shuffle_epi8 for the 5.1 -> 2.0 downmix.
+arch=()
+if [[ "$(uname -m)" == "x86_64" ]]; then
+    arch=(-mssse3)
+fi
+flags=(-std=c++20 -O1 -Wall "${arch[@]}" -I "$cpp" -I "$cpp/xenia" -I "$cpp/xenia/src" -I "$test/stubs")
 for name in presentation_runtime_test pipeline_cache_file_test vblank_pacer_test changed_settings_test frame_stats_test audio_buffer_tuner_test audio_block_renderer_test xex_header_test fatx_package_name_test socket_option_test xnet_startup_test structured_jumps_test draw_export_tracker_test; do
     "${cxx[@]}" "${flags[@]}" "$test/$name.cc" -o "$build/$name"
 done
