@@ -163,7 +163,7 @@ object SettingDescriptions {
         "value_convert_7e3_8888_reuse" to "Decode HDR EDRAM tiles reused as 8-bit color before blending, avoiding garbage-colored backgrounds",
         "video_standard" to "Video signal standard the console reports (NTSC, NTSC-J, or PAL); can affect region behavior",
         "vulkan_allow_present_mode_fifo_relaxed" to "Allow relaxed vsync presentation, which may tear when frames miss the display refresh rate",
-        "vulkan_allow_present_mode_immediate" to "Allow immediate presentation for lowest latency, at the cost of possible tearing",
+        "vulkan_allow_present_mode_immediate" to "Allow immediate presentation for lowest latency, at the cost of possible tearing. Off by default on Android to avoid uncapped power draw and heat",
         "vulkan_allow_present_mode_mailbox" to "Allow mailbox presentation, giving low latency without tearing when the driver supports it. Off by default: on HyperOS the image could freeze after minutes of play with it",
         "vulkan_async_skip_draws" to "Drop draws whose shaders are still compiling instead of waiting; brief pop-in instead of stutter",
         "vulkan_cache_texture_descriptors" to "Reuse texture/sampler descriptor sets across unchanged draws; disable to debug texture corruption",

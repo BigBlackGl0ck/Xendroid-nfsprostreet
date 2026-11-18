@@ -278,6 +278,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     /** Menu texts; on, off and failures also go to the run's timeline (never the address or code). */
     private fun refreshPhoneControllers() {
+        wakeFastTick()
         phoneControllersLabel.value = xendroid.compose.ui.ingame.phoneControllersLabel(this, phoneControllers.status)
         phoneControllersDetails.value = xendroid.compose.ui.ingame.phoneControllersDetails(this, phoneControllers.status)
         val status = when (val s = phoneControllers.status) {
@@ -361,8 +362,21 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val scalingEffect = mutableIntStateOf(-1)
     /** The Image options tried from the in-game menu (each -1: the game's Settings value). */
     private val imageTuning = mutableStateOf(xendroid.compose.core.ImageTuning())
-    private val performanceHints by lazy { PresenterPerformanceHints(applicationContext) }
+    private val performanceHints by lazy {
+        PresenterPerformanceHints(applicationContext) { targetNs -> session.setPresenterAdpfTarget(targetNs) }
+    }
     private val performanceHintsLabel = mutableStateOf("Presenter ADPF · Off")
+    private val fastTickWake = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
+    private fun wakeFastTick() { fastTickWake.trySend(Unit) }
+
+    private fun syncPerformanceHints() {
+        performanceHints.update(
+            session.presenterWork(),
+            PresenterPerformanceHints.targetDurationNs(session.fpsLimit(), currentOutputHz()),
+            foregroundState.value && !menuState.value.open && !session.isPaused(),
+        )
+        performanceHintsLabel.value = performanceHints.status
+    }
     private var started = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -500,7 +514,10 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         val unbuffered = unbufferedInput.value != options.unbufferedInput
         unbufferedInput.value = options.unbufferedInput
         if (unbuffered && window?.decorView?.isAttachedToWindow == true) applyUnbufferedInput()
-        if (rumbleSettings.value.default != options.rumble) rumbleSettings.value = rumbleSettings.value.copy(default = options.rumble)
+        if (rumbleSettings.value.default != options.rumble) {
+            rumbleSettings.value = rumbleSettings.value.copy(default = options.rumble)
+            wakeFastTick()
+        }
         val gyro = options.gyroCamera && gyroCamera.available
         if (gyro != gyroEnabled.value) {
             gyroEnabled.value = gyro
@@ -980,6 +997,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         controllers[deviceId] = id
         val key = device.descriptor ?: "device:$deviceId"
         controllerKeys[deviceId] = key
+        wakeFastTick()
         // #76: its player comes with its first input ([claimPlayer]).
         recordEvent("controller", "$what ($id)")
     }
@@ -997,6 +1015,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         recordEvent("controller", "${controllers[deviceId] ?: "a controller"} " +
             (slot?.let { "plays as P${it + 1}" } ?: "plays with no free player slot"))
         if (slot != null && slot > 0) session.setSlotConnected(slot, true, "Controller ${slot + 1}")
+        wakeFastTick()
     }
 
     /** A controller that hasn't played yet: nothing it sends is the game's (its sticks at rest
@@ -1052,6 +1071,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         controllerSlots.players.forEachIndexed { slot, key ->
             if (slot > 0 && key != null) session.setSlotConnected(slot, true, "Controller ${slot + 1}")
         }
+        wakeFastTick()
     }
 
     /** Per-second flight recorder checks: presentation state changes and guest stalls. */
@@ -1658,29 +1678,42 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                                 // applies its owner's intensity. Their input is held meanwhile.
                                 launch {
                                     while (isActive) {
-                                        delay(50)
+                                        val now = SystemClock.uptimeMillis()
                                         // U10: the same for the keyboard grid, in two dimensions.
-                                        if (keyboardRequestState.value != null && gridHatDirection != 4 &&
-                                            gridRepeat.press(gridHatDirection, SystemClock.uptimeMillis())) {
+                                        val kbHeld = keyboardRequestState.value != null && gridHatDirection != 4
+                                        if (kbHeld && gridRepeat.press(gridHatDirection, now)) {
                                             keyboardGrid.value = keyboardGrid.value.move(gridHatDirection % 3 - 1, gridHatDirection / 3 - 1)
                                         }
+
                                         // U04: a stick or hat held on a menu keeps moving at the menu's pace.
                                         val heldDirection = if (panelNavPrev) -1 else if (panelNavNext) 1 else 0
                                         if (heldDirection != 0) panelNav()?.let { nav ->
-                                            if (navRepeat.press(heldDirection, SystemClock.uptimeMillis())) movePanelSelection(nav, heldDirection)
+                                            if (navRepeat.press(heldDirection, now)) movePanelSelection(nav, heldDirection)
                                         }
                                         // Round 2: held left or right on a menu row keeps changing its value.
                                         val heldAdjust = if (panelNavLeft) -1 else if (panelNavRight) 1 else 0
-                                        if (heldAdjust != 0 && menuRowsActive() && navRepeat.press(heldAdjust * 2, SystemClock.uptimeMillis())) {
+                                        val menuAdjustHeld = heldAdjust != 0 && menuRowsActive()
+                                        if (menuAdjustHeld && navRepeat.press(heldAdjust * 2, now)) {
                                             adjustSelectedRow(heldAdjust)
                                         }
                                         val playing = foregroundState.value && !menuState.value.open && !session.isPaused()
                                         val phones = phoneControllers.host != null
-                                        val controllerRumble = rumbleSettings.value.anyOn
+                                        val hasPhysicalController = controllerSlots.players.any {
+                                            it != null && !it.startsWith(xendroid.compose.companion.CompanionHost.KEY_PREFIX)
+                                        }
+                                        val controllerRumble = rumbleSettings.value.anyOn && hasPhysicalController
                                         val guest = if (playing && (controllerRumble || phones)) session.rumbleState() else null
                                         if (phones) runCatching { phoneControllers.tick(playing, guest) }
                                         val state = if (controllerRumble) guest else null
                                         if (state == null) stopRumble() else runCatching { driveRumble(state) }
+
+                                        // #123: suspend completely (0 Hz) when touch-only, menu-idle, or backgrounded without companion phones.
+                                        val needFastTick = kbHeld || heldDirection != 0 || menuAdjustHeld || phones || (playing && controllerRumble)
+                                        if (needFastTick) {
+                                            delay(50)
+                                        } else {
+                                            fastTickWake.receive()
+                                        }
                                     }
                                 }
                                 syncControllerSlots()
@@ -1698,10 +1731,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                                     }
 
                                     val activeTitle = session.activeTitleId()
-                                    performanceHints.update(session.presenterWork(),
-                                        1_000_000_000L / session.fpsLimit().coerceAtLeast(30),
-                                        foregroundState.value && !menuState.value.open)
-                                    performanceHintsLabel.value = performanceHints.status
+                                    syncPerformanceHints()
                                     val activeRun = runId
                                     if (activeTitle != controlsTitleId) {
                                         controlsTitleId = activeTitle
@@ -1948,41 +1978,47 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
 
                             val keyboardRequest by
                                 keyboardRequestState
+                            val messageBoxRequest by
+                                messageBoxRequestState
+                            val discRequest by
+                                discRequestState
 
-                            LaunchedEffect(
-                                booted
-                            ) {
-                                if (!booted) {
-                                    return@LaunchedEffect
-                                }
-
+                            // #123: single guest UI prompt poll (replaces 3 separate 150 ms coroutines) and suspends at 0 Hz in background.
+                            LaunchedEffect(booted) {
+                                if (!booted) return@LaunchedEffect
                                 while (isActive) {
-                                    if (
-                                        keyboardRequestState.value ==
-                                            null
-                                    ) {
-                                        session
-                                            .keyboardRequest()
-                                            ?.let { req ->
-
-                                                val maxUnits = if (req.maxLength <= 0) Int.MAX_VALUE else req.maxLength
-                                                keyboardGrid.value = xendroid.compose.ui.keyboard.KeyboardGrid(maxUnits = maxUnits)
-                                                    .withText(req.defaultText.orEmpty())
-                                                gridHatDirection = 4
-                                                gridRepeat.release()
-
-                                                panelSelectedState.intValue =
-                                                    0
-
-                                                keyboardRequestState.value =
-                                                    req
-                                                recordEvent("guest-ui", "text entry prompt")
-                                            }
+                                    if (!foregroundState.value) {
+                                        androidx.compose.runtime.snapshotFlow { foregroundState.value }.first { it }
                                     }
-
-                                    delay(
-                                        KEYBOARD_POLL_MS
-                                    )
+                                    if (keyboardRequestState.value == null) {
+                                        session.keyboardRequest()?.let { req ->
+                                            val maxUnits = if (req.maxLength <= 0) Int.MAX_VALUE else req.maxLength
+                                            keyboardGrid.value = xendroid.compose.ui.keyboard.KeyboardGrid(maxUnits = maxUnits)
+                                                .withText(req.defaultText.orEmpty())
+                                            gridHatDirection = 4
+                                            gridRepeat.release()
+                                            panelSelectedState.intValue = 0
+                                            keyboardRequestState.value = req
+                                            recordEvent("guest-ui", "text entry prompt")
+                                        }
+                                    }
+                                    if (messageBoxRequestState.value == null) {
+                                        session.messageBoxRequest()?.let { req ->
+                                            panelSelectedState.intValue = req.activeButton
+                                            messageBoxRequestState.value = req
+                                            recordEvent("guest-ui", "message box (${req.buttons?.size ?: 0} buttons)")
+                                        }
+                                    }
+                                    if (discRequestState.value == null) {
+                                        session.discRequest()?.let { req ->
+                                            // The disc the game asks for first, by the number in its label.
+                                            panelSelectedState.intValue =
+                                                xendroid.compose.ui.disc.requestedDiscIndex(req)
+                                            discRequestState.value = req
+                                            recordEvent("guest-ui", "disc ${req.discNumber} requested", flush = true)
+                                        }
+                                    }
+                                    delay(KEYBOARD_POLL_MS)
                                 }
                             }
 
@@ -1990,61 +2026,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                                 xendroidTheme(scale = uiScale, mode = hostMode) {
                                     GuestKeyboardPanel(
                                         request = req,
-
                                         grid = keyboardGrid.value,
-
                                         onGridChange = { keyboardGrid.value = it },
-
-                                        onAccept = {
-                                            text ->
-                                            acceptKeyboard(
-                                                text
-                                            )
-                                        },
-
-                                        onCancel = {
-                                            cancelKeyboard()
-                                        },
-
-                                        modifier =
-                                            Modifier.fillMaxSize(),
-
+                                        onAccept = { text -> acceptKeyboard(text) },
+                                        onCancel = { cancelKeyboard() },
+                                        modifier = Modifier.fillMaxSize(),
                                         gameName = loadingName,
                                         art = loadingArt.value,
-                                    )
-                                }
-                            }
-
-                            val messageBoxRequest by
-                                messageBoxRequestState
-
-                            LaunchedEffect(
-                                booted
-                            ) {
-                                if (!booted) {
-                                    return@LaunchedEffect
-                                }
-
-                                while (isActive) {
-                                    if (
-                                        messageBoxRequestState.value ==
-                                            null
-                                    ) {
-                                        session
-                                            .messageBoxRequest()
-                                            ?.let { req ->
-
-                                                panelSelectedState.intValue =
-                                                    req.activeButton
-
-                                                messageBoxRequestState.value =
-                                                    req
-                                                recordEvent("guest-ui", "message box (${req.buttons?.size ?: 0} buttons)")
-                                            }
-                                    }
-
-                                    delay(
-                                        KEYBOARD_POLL_MS
                                     )
                                 }
                             }
@@ -2053,57 +2041,11 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                                 xendroidTheme(scale = uiScale, mode = hostMode) {
                                     GuestMessageBoxPanel(
                                         request = req,
-
-                                        selected =
-                                            panelSelectedState.intValue,
-
-                                        onChoose = {
-                                            button ->
-                                            answerMessageBox(
-                                                button
-                                            )
-                                        },
-
-                                        modifier =
-                                            Modifier.fillMaxSize(),
-
+                                        selected = panelSelectedState.intValue,
+                                        onChoose = { button -> answerMessageBox(button) },
+                                        modifier = Modifier.fillMaxSize(),
                                         gameName = loadingName,
                                         art = loadingArt.value,
-                                    )
-                                }
-                            }
-
-                            val discRequest by
-                                discRequestState
-
-                            LaunchedEffect(
-                                booted
-                            ) {
-                                if (!booted) {
-                                    return@LaunchedEffect
-                                }
-
-                                while (isActive) {
-                                    if (
-                                        discRequestState.value ==
-                                            null
-                                    ) {
-                                        session
-                                            .discRequest()
-                                            ?.let { req ->
-
-                                                // The disc the game asks for first, by the number in its label.
-                                                panelSelectedState.intValue =
-                                                    xendroid.compose.ui.disc.requestedDiscIndex(req)
-
-                                                discRequestState.value =
-                                                    req
-                                                recordEvent("guest-ui", "disc ${req.discNumber} requested", flush = true)
-                                            }
-                                    }
-
-                                    delay(
-                                        KEYBOARD_POLL_MS
                                     )
                                 }
                             }
@@ -2355,6 +2297,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     override fun onStart() {
         super.onStart()
         foregroundState.value = true
+        wakeFastTick()
         recordEvent("lifecycle", "foreground")
 
         EmuProcessLink.setEmuForeground(
@@ -2395,6 +2338,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             recordEvent("pause", "guest resumed")
         }
         if (gyroEnabled.value && foregroundState.value && !menuState.value.open && hasWindowFocus()) gyroCamera.start()
+        syncPerformanceHints()
+        wakeFastTick()
     }
 
     override fun onDestroy() {
@@ -3116,6 +3061,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         fpsLimitState.intValue = session.fpsLimit()
         presentationState.value = session.presentationState()
         menuState.value = menuState.value.copy(frameTrace = session.frameTraceAvailable()).show(pausedHere)
+        syncPerformanceHints()
         menuStatus.value = runCatching { buildMenuStatus() }.getOrDefault(emptyList())
         refreshFpsConfig()
         refreshDriverLine()
@@ -3131,11 +3077,15 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         recordEvent("menu", "closed")
         panelNavPrev = false
         panelNavNext = false
+        panelNavLeft = false
+        panelNavRight = false
         if (resume) {
             pausedByLifecycle = true
             resumeForLifecycle()
         }
         if (gyroEnabled.value && hasWindowFocus()) gyroCamera.start()
+        syncPerformanceHints()
+        wakeFastTick()
     }
 
     private fun backMenu() {
@@ -3424,7 +3374,10 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             return
         }
         when (action) {
-            InGameAction.PERFORMANCE_HINTS -> performanceHints.requested = !performanceHints.requested
+            InGameAction.PERFORMANCE_HINTS -> {
+                performanceHints.requested = !performanceHints.requested
+                syncPerformanceHints()
+            }
             InGameAction.EXTERNAL_DISPLAY -> externalDisplay?.cycle()
             InGameAction.GYRO_CAMERA -> if (gyroCamera.available) {
                 gyroEnabled.value = !gyroEnabled.value
@@ -3724,6 +3677,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 val rumble = rumbleSettings.value.default
                 saveControlOptions { it.copy(rumble = rumble) }
                 stopRumble()
+                wakeFastTick()
             }
             InGameAction.SPLIT_SCREEN -> lifecycleScope.launch {
                 // Saved with the touch controls (as the editor's "Split screen"): off, at a fold, always.
@@ -3865,6 +3819,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         generationCap.forget()
         fpsLimitState.intValue = fps
         session.setFpsLimit(fps)
+        syncPerformanceHints()
         keepChange(FPS_KEY, fps.toString())
     }
 
@@ -4209,6 +4164,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         hatDown = false
         panelNavPrev = false
         panelNavNext = false
+        panelNavLeft = false
+        panelNavRight = false
         slotInput.releaseAll()
         stopRumble()
     }
@@ -4269,7 +4226,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     /** The menu is open on its rows (not asking to quit or for a log): ←→ adjust there. */
     private fun menuRowsActive(): Boolean =
-        menuState.value.open && !hasGuestPrompt() && !menuState.value.confirmingQuit && !menuState.value.logPicker
+        menuState.value.open && !editorOpen.value &&
+            !hasGuestPrompt() && !menuState.value.confirmingQuit && !menuState.value.logPicker
 
     private fun adjustSelectedRow(delta: Int) {
         menuState.value.action?.let { adjustMenuAction(it, delta) }
@@ -4302,6 +4260,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             if (up != panelNavPrev) { panelNavPrev = up; if (up && navRepeat.press(-1, now)) movePanelSelection(nav, -1) }
             if (down != panelNavNext) { panelNavNext = down; if (down && navRepeat.press(1, now)) movePanelSelection(nav, 1) }
             if (!panelNavPrev && !panelNavNext && !panelNavLeft && !panelNavRight) navRepeat.release()
+            else wakeFastTick()
             return
         }
         val y =
@@ -4338,6 +4297,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             if (next && navRepeat.press(1, SystemClock.uptimeMillis())) movePanelSelection(nav, 1)
         }
         if (!panelNavPrev && !panelNavNext) navRepeat.release()
+        else wakeFastTick()
     }
 
     private fun movePanelSelection(
@@ -4471,8 +4431,11 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (direction == gridHatDirection) return
         gridHatDirection = direction
         gridRepeat.release()
-        if (direction != 4 && gridRepeat.press(direction, SystemClock.uptimeMillis())) {
-            keyboardGrid.value = keyboardGrid.value.move(dx, dy)
+        if (direction != 4) {
+            if (gridRepeat.press(direction, SystemClock.uptimeMillis())) {
+                keyboardGrid.value = keyboardGrid.value.move(dx, dy)
+            }
+            wakeFastTick()
         }
     }
 

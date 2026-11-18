@@ -53,7 +53,8 @@ class SettingsSchemaTest {
             "Vulkan|vulkan_dynamic_rendering", "Vulkan|vulkan_avoid_geometry_shaders", "Vulkan|vulkan_depth_unorm24",
             "General|guest_crash_is_fatal").forEach { b(it, true) }
         listOf("GPU|depth_bias_shader_offset", "GPU|memexport_enable", "UI|achievement_notification_position_by_game",
-            "Storage|mount_memory_unit").forEach { b(it, false) }
+            "Storage|mount_memory_unit", "Vulkan|vulkan_allow_present_mode_immediate",
+            "Vulkan|vulkan_allow_present_mode_mailbox").forEach { b(it, false) }
         assertEquals("0", (SettingsSchema.byKey["GPU|draw_resolution_scale_threshold"] as Setting.ListChoice).default)
         assertEquals("-1", (SettingsSchema.byKey["Kernel|console_type"] as Setting.ListChoice).default)
         val gamma = SettingsSchema.byKey["Kernel|kernel_display_gamma_power"] as Setting.ListChoice
