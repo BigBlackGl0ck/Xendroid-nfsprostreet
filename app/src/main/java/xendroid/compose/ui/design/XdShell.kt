@@ -99,7 +99,7 @@ enum class XdArea(val label: Int, val optional: Boolean = false) {
 }
 
 /** Where the Start menu also leads, beyond the areas. */
-enum class XdShortcut { DIAGNOSTICS, COMPARE, ABOUT }
+enum class XdShortcut { FOLDERS, DIAGNOSTICS, COMPARE, ABOUT }
 
 /** What the frame needs from navigation; the nav host provides it. */
 interface XdNavigator {
@@ -778,17 +778,20 @@ fun CGuide(onDismiss: () -> Unit) {
                         Text(stringResource(R.string.xd_guide_active), style = XdText.small, color = c.fg3)
                     }
                 }
-                val items = listOf(
-                    Triple(XdIcons.grid, R.string.xd_guide_library) { nav.area(XdArea.GAMES) },
-                    Triple(XdIcons.box, R.string.xd_area_content) { nav.area(XdArea.CONTENT) },
-                    Triple(XdIcons.user, R.string.xd_area_profiles) { nav.area(XdArea.PROFILES) },
-                    Triple(XdIcons.gamepad, R.string.xd_area_controls) { nav.area(XdArea.CONTROLS) },
-                    Triple(XdIcons.chip, R.string.xd_area_drivers) { nav.area(XdArea.DRIVERS) },
-                    Triple(XdIcons.gear, R.string.xd_guide_settings) { nav.area(XdArea.SETTINGS) },
-                    Triple(XdIcons.bug, R.string.xd_guide_diagnostics) { nav.shortcut(XdShortcut.DIAGNOSTICS) },
-                    Triple(XdIcons.ab, R.string.xd_guide_compare) { nav.shortcut(XdShortcut.COMPARE) },
-                    Triple(XdIcons.info, R.string.xd_guide_about) { nav.shortcut(XdShortcut.ABOUT) },
-                )
+                val items = buildList {
+                    add(Triple(XdIcons.grid, R.string.xd_guide_library) { nav.area(XdArea.GAMES) })
+                    if (xendroid.compose.core.AllFilesAccess.isSupported) {
+                        add(Triple(XdIcons.folder, R.string.lib_menu_folders) { nav.shortcut(XdShortcut.FOLDERS) })
+                    }
+                    add(Triple(XdIcons.box, R.string.xd_area_content) { nav.area(XdArea.CONTENT) })
+                    add(Triple(XdIcons.user, R.string.xd_area_profiles) { nav.area(XdArea.PROFILES) })
+                    add(Triple(XdIcons.gamepad, R.string.xd_area_controls) { nav.area(XdArea.CONTROLS) })
+                    add(Triple(XdIcons.chip, R.string.xd_area_drivers) { nav.area(XdArea.DRIVERS) })
+                    add(Triple(XdIcons.gear, R.string.xd_guide_settings) { nav.area(XdArea.SETTINGS) })
+                    add(Triple(XdIcons.bug, R.string.xd_guide_diagnostics) { nav.shortcut(XdShortcut.DIAGNOSTICS) })
+                    add(Triple(XdIcons.ab, R.string.xd_guide_compare) { nav.shortcut(XdShortcut.COMPARE) })
+                    add(Triple(XdIcons.info, R.string.xd_guide_about) { nav.shortcut(XdShortcut.ABOUT) })
+                }
                 items.forEachIndexed { i, (icon, label, go) ->
                     GuideItem(icon, stringResource(label), if (i == 0) Modifier.focusRequester(first) else Modifier) { onDismiss(); go() }
                 }
