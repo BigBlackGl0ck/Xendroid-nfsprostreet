@@ -1288,10 +1288,22 @@ static jstring j_active_driver_identity(JNIEnv* env, jobject thiz) {
 static jlongArray j_presenter_work(JNIEnv* env, jobject thiz) {
     const auto& runtime = xe::ui::RuntimePresentation();
     const jlong values[] = {runtime.presenter_tid.load(), runtime.presenter_work_ns.load(),
-        static_cast<jlong>(runtime.presenter_work_sequence.load(std::memory_order_acquire))};
-    auto array = env->NewLongArray(3);
-    if (array) env->SetLongArrayRegion(array, 0, 3, values);
+        static_cast<jlong>(runtime.presenter_work_sequence.load(std::memory_order_acquire)),
+        runtime.presenter_adpf_state.load(std::memory_order_relaxed)};
+    auto array = env->NewLongArray(4);
+    if (array) env->SetLongArrayRegion(array, 0, 4, values);
     return array;
+}
+static void j_set_presenter_adpf_target(JNIEnv* env, jobject thiz, jlong target_ns) {
+    auto& runtime = xe::ui::RuntimePresentation();
+    const int64_t clamped = target_ns > 0 ? int64_t(target_ns) : 0;
+    runtime.presenter_adpf_target_ns.store(clamped, std::memory_order_relaxed);
+    void (*sync)(int64_t) = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runtime.configuration_mutex);
+        sync = runtime.presenter_adpf_sync;
+    }
+    if (sync) sync(clamped);
 }
 // The diagnostic build's "Capture frame" (ae::request_frame_trace).
 static jboolean j_frame_trace_available(JNIEnv* env, jobject thiz) { return ae::frame_trace_available(); }
@@ -2156,6 +2168,7 @@ int register_xendroid_Emulator(JNIEnv* env){
             ,{"frame_trace_available", "()Z", (void *) j_frame_trace_available}
             ,{"request_frame_trace", "()Z", (void *) j_request_frame_trace}
             ,{"presenter_work", "()[J", (void *) j_presenter_work}
+            ,{"set_presenter_adpf_target", "(J)V", (void *) j_set_presenter_adpf_target}
             ,{"set_frame_generation", "(ZIF)V", (void *) j_set_frame_generation}
             ,{"set_zerofg_mode", "(I)V", (void *) j_set_zerofg_mode}
             ,{"zerofg_mode", "()I", (void *) j_zerofg_mode}
