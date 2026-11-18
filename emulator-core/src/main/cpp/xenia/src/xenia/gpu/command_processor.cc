@@ -259,17 +259,15 @@ std::atomic<int> readback_resolve_mode_cache{-1};
 std::atomic<int> zpd_mode_cache{-1};
 
 ReadbackResolveMode ParseReadbackResolveMode(const std::string& mode) {
-  if (mode == "all") {
+  if (mode == "all" || mode == "full") {
     return ReadbackResolveMode::kAll;
   } else if (mode == "uma") {
     return ReadbackResolveMode::kUma;
   } else if (mode == "none") {
     return ReadbackResolveMode::kDisabled;
-  } else if (mode == "fast") {
+  } else if (mode == "fast" || mode == "some") {
     return ReadbackResolveMode::kFast;
   } else {
-    // Retired values (some/full) and typos: fall back to the default rather
-    // than to a mode that copies nothing on unified-memory GPUs.
     static bool logged = false;
     if (!logged) {
       logged = true;
@@ -531,7 +529,8 @@ void CommandProcessor::ClearReadbackBuffers() {}
 
 void CommandProcessor::SetReadbackResolveMode(ReadbackResolveMode mode,
                                               bool persist) {
-  if (cached_readback_resolve_mode_ == mode) {
+  if (xe::gpu::GetReadbackResolveMode() == mode &&
+      cached_readback_resolve_mode_ == mode) {
     return;
   }
   // Update cached value

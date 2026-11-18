@@ -331,10 +331,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // #414.
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_maintenance4, 1, 3)
   }
-  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
-    // #55. Dynamic rendering removes render pass/framebuffer overhead.
-    XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
-  }
 
   bool ext_GOOGLE_display_timing = false;
   if (with_swapchain) {
@@ -360,7 +356,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   bool ext_1_2_KHR_shader_float_controls = false;
   bool ext_EXT_fragment_shader_interlock = false;
   bool ext_1_3_EXT_shader_demote_to_helper_invocation = false;
-  bool ext_1_3_KHR_dynamic_rendering = false;
   bool ext_EXT_non_seamless_cube_map = false;
   bool ext_EXT_custom_border_color = false;
   bool ext_1_3_EXT_subgroup_size_control = false;
@@ -403,11 +398,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_robustness2)
       // #252.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
-      // #55.
-      XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
-      // #233. In-pass reads of current attachments for tiler-native resolves.
-      XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering_local_read,
-                                             1, 4)
+      // #55 / #233. VK_KHR_dynamic_rendering requires VK_KHR_depth_stencil_resolve,
+      // VK_KHR_create_renderpass2, VK_KHR_multiview, and VK_KHR_maintenance2, all
+      // promoted to Vulkan 1.2 core. Vulkan 1.0/1.1 drivers (such as Adreno 610)
+      // use standard render passes and framebuffers instead.
+      if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+        XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
+        // In-pass reads of current attachments for tiler-native resolves.
+        XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering_local_read,
+                                               1, 4)
+      }
       // #277.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(
           EXT_shader_demote_to_helper_invocation, 1, 3)
@@ -422,8 +422,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_LOCAL_EXTENSION(KHR_fragment_shader_barycentric)
       XE_UI_VULKAN_LOCAL_EXTENSION(NV_fragment_shader_barycentric)
       // #456. Per-sub-feature dynamic state used to collapse pipeline key
-      // permutations. EDS1/EDS2 are core in 1.3; only EDS3 needs an extension.
-      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_extended_dynamic_state3)
+      // permutations. EDS1/EDS2 are core in 1.3; only request EDS3 when 1.3
+      // dynamic state is usable.
+      if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+        XE_UI_VULKAN_STRUCT_EXTENSION(EXT_extended_dynamic_state3)
+      }
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
       // #237.
@@ -566,6 +569,23 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         }
       }
     }
+  }
+
+  // VK_KHR_dynamic_rendering_local_read requires VK_KHR_dynamic_rendering (or
+  // Vulkan 1.3 core). Drop it if dynamic rendering is unavailable.
+  if (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0) &&
+      !device->extensions_.ext_1_3_KHR_dynamic_rendering &&
+      device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read) {
+    device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read = false;
+    enabled_extensions.erase(
+        std::remove_if(enabled_extensions.begin(), enabled_extensions.end(),
+                       [](const char* ext_name) {
+                         return std::strcmp(
+                                    ext_name,
+                                    VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME) ==
+                                0;
+                       }),
+        enabled_extensions.end());
   }
 
   if (with_swapchain && !device->extensions_.ext_KHR_swapchain) {
@@ -781,7 +801,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         features_1_3_EXT_shader_demote_to_helper_invocation.Link(
             supported_features_2, device_create_info);
       }
-      if (ext_1_3_KHR_dynamic_rendering) {
+      if (device->extensions_.ext_1_3_KHR_dynamic_rendering) {
         features_1_3_KHR_dynamic_rendering.Link(supported_features_2,
                                                 device_create_info);
       }
@@ -1361,7 +1381,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
             shaderDemoteToHelperInvocation);
       }
     }
-    if (ext_1_3_KHR_dynamic_rendering) {
+    if (device->extensions_.ext_1_3_KHR_dynamic_rendering) {
       if (with_gpu_emulation) {
         XE_UI_VULKAN_FEATURE_2(features_1_3_KHR_dynamic_rendering,
                                dynamicRendering);
@@ -1731,7 +1751,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #include "xenia/ui/vulkan/functions/device_1_2_ext_host_query_reset.inc"
   }
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
-#include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
 #include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
     // VK_EXT_extended_dynamic_state (#268) + VK_EXT_extended_dynamic_state2
     // (#378) setters and the core topology/restart setters, all promoted to
@@ -1740,9 +1759,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #include "xenia/ui/vulkan/functions/device_ext_extended_dynamic_state.inc"
 #include "xenia/ui/vulkan/functions/device_1_3_core_dynamic_topology.inc"
     }
-  }
-  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 4, 0)) {
-#include "xenia/ui/vulkan/functions/device_1_4_khr_dynamic_rendering_local_read.inc"
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
@@ -1769,14 +1785,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (device->extensions_.ext_1_3_KHR_maintenance4) {
 #include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
     }
-    if (device->extensions_.ext_1_3_KHR_dynamic_rendering) {
-#include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
-    }
-  }
-  if (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 4, 0)) {
-    if (device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read) {
-#include "xenia/ui/vulkan/functions/device_1_4_khr_dynamic_rendering_local_read.inc"
-    }
   }
   if (device->extensions_.ext_KHR_swapchain) {
 #include "xenia/ui/vulkan/functions/device_khr_swapchain.inc"
@@ -1784,6 +1792,72 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
 #undef XE_UI_VULKAN_FUNCTION
+
+  // Dynamic rendering (#55) and local read (#233) are optional fast paths -
+  // load them non-fatally and fall back to VkRenderPass if entry points are
+  // missing on the active driver/wrapper instead of leaving null pointers or
+  // failing device initialization.
+  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0) ||
+      device->extensions_.ext_1_3_KHR_dynamic_rendering) {
+    bool dr_functions_loaded = true;
+    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  dr_functions_loaded &=                                          \
+      (dfn.core_name = PFN_##core_name(                           \
+           ifn.vkGetDeviceProcAddr(device->device_, #core_name))) != nullptr;
+#include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+    } else {
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  dr_functions_loaded &=                                          \
+      (dfn.core_name = PFN_##core_name(ifn.vkGetDeviceProcAddr(   \
+           device->device_, #extension_name))) != nullptr;
+#include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+    }
+    if (!dr_functions_loaded) {
+      XELOGW(
+          "VulkanDevice: Dynamic rendering entry points missing on '{}', "
+          "falling back to render passes",
+          properties.deviceName);
+      device->extensions_.ext_1_3_KHR_dynamic_rendering = false;
+      device->properties_.dynamicRendering = false;
+      device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read = false;
+      device->properties_.dynamicRenderingLocalRead = false;
+    }
+  } else {
+    device->properties_.dynamicRendering = false;
+    device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read = false;
+    device->properties_.dynamicRenderingLocalRead = false;
+  }
+
+  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 4, 0) ||
+      device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read) {
+    bool dr_local_read_loaded = true;
+    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 4, 0)) {
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  dr_local_read_loaded &=                                         \
+      (dfn.core_name = PFN_##core_name(                           \
+           ifn.vkGetDeviceProcAddr(device->device_, #core_name))) != nullptr;
+#include "xenia/ui/vulkan/functions/device_1_4_khr_dynamic_rendering_local_read.inc"
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+    } else {
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  dr_local_read_loaded &=                                         \
+      (dfn.core_name = PFN_##core_name(ifn.vkGetDeviceProcAddr(   \
+           device->device_, #extension_name))) != nullptr;
+#include "xenia/ui/vulkan/functions/device_1_4_khr_dynamic_rendering_local_read.inc"
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+    }
+    if (!dr_local_read_loaded) {
+      XELOGW(
+          "VulkanDevice: Dynamic rendering local read entry points missing on "
+          "'{}', disabling local read",
+          properties.deviceName);
+      device->extensions_.ext_1_4_KHR_dynamic_rendering_local_read = false;
+      device->properties_.dynamicRenderingLocalRead = false;
+    }
+  }
 
   // VK_EXT_extended_dynamic_state3 (#456) is optional and never promoted - load
   // its EXT-named setters non-fatally (like vkGetDeviceFaultInfoEXT). If any are

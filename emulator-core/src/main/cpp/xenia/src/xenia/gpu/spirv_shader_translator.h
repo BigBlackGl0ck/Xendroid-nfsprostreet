@@ -920,6 +920,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id AluAdd(spv::Id a, spv::Id b);
   spv::Id AluSubtract(spv::Id a, spv::Id b);
   spv::Id AluMultiply(spv::Id a, spv::Id b);
+  spv::Id AluAddMasked(spv::Id a, spv::Id b, uint32_t used_components,
+                       uint32_t rtz_components);
+  spv::Id AluSubtractMasked(spv::Id a, spv::Id b, uint32_t used_components,
+                            uint32_t rtz_components);
+  spv::Id AluMultiplyMasked(spv::Id a, spv::Id b, uint32_t used_components,
+                            uint32_t rtz_components);
   // Steps a sum or product of a and b rounded to nearest toward zero if its
   // exact error shows it rounded away, and saturates overflow.
   spv::Id RoundTowardZero(spv::Id rounded, spv::Id error, spv::Id a, spv::Id b);
@@ -1489,8 +1495,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool cf_exec_predicate_written_;
 
   // Whether the result of the ALU operation being translated is
-  // rounding-sensitive (see Shader::IsAluVectorResultRoundingSensitive).
+  // rounding-sensitive (see Shader::IsAluVectorResultRoundingSensitive) and,
+  // for vector ALU ops, the 4-bit mask of sensitive result components.
   bool alu_op_result_rounding_sensitive_ = false;
+  uint32_t alu_vector_rounding_sensitive_components_ = 0;
 };
 
 }  // namespace gpu

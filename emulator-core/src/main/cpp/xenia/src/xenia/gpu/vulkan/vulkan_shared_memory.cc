@@ -120,13 +120,23 @@ bool VulkanSharedMemory::Initialize() {
     buffer_create_info.queueFamilyIndexCount = 0;
     buffer_create_info.pQueueFamilyIndices = nullptr;
   }
-  // readback_resolve=uma reads guest RAM through this buffer's host mapping,
-  // and only the dense buffer below can be mapped, so uma overrides sparse.
-  const bool needs_host_mapping = cvars::readback_resolve == "uma";
+  // Second (host-imported) buffer for memexport and kFast/kAll resolve
+  // readbacks when VK_EXT_external_memory_host is available. Probed before the
+  // sparse/dense choice below so unified-memory GPUs without host-memory import
+  // (Adreno) fall back to a dense host-mapped buffer whenever readback or
+  // memexport needs CPU visibility.
+  TryInitializeHostBuffer();
+
+  const ReadbackResolveMode readback_mode = GetReadbackResolveMode();
+  const bool needs_host_mapping =
+      readback_mode == ReadbackResolveMode::kUma ||
+      (host_buffer_ == VK_NULL_HANDLE &&
+       (readback_mode != ReadbackResolveMode::kDisabled ||
+        cvars::memexport_enable));
   if (needs_host_mapping && cvars::vulkan_sparse_shared_memory) {
     XELOGI(
         "Shared memory: sparse binding disabled so the buffer can be "
-        "host-mapped for readback_resolve=uma");
+        "host-mapped for resolve/memexport readback");
   }
   if (cvars::vulkan_sparse_shared_memory && !needs_host_mapping &&
       vulkan_device->properties().sparseResidencyBuffer) {
@@ -307,9 +317,15 @@ bool VulkanSharedMemory::Initialize() {
       xe::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize,
                 size_t(1) << page_size_log2()));
 
-  // Second (host-imported) buffer for memexport-touching draws on the
-  // device-local path, so their output stays coherent with the CPU.
-  TryInitializeHostBuffer();
+  if (cvars::memexport_enable && host_buffer_ == VK_NULL_HANDLE) {
+    if (IsHostMapped()) {
+      XELOGI("Shared memory: guest RAM import unavailable - memexport uses "
+             "host-mapped readback");
+    } else {
+      XELOGW("Shared memory: memexport needs guest RAM import or a host-mapped "
+             "buffer");
+    }
+  }
 
   return true;
 }
@@ -470,25 +486,22 @@ bool VulkanSharedMemory::TryInitializeZeroCopy() {
 }
 
 void VulkanSharedMemory::TryInitializeHostBuffer() {
-  if (!cvars::memexport_enable) {
+  const ReadbackResolveMode readback_mode = GetReadbackResolveMode();
+  if (!cvars::memexport_enable &&
+      readback_mode != ReadbackResolveMode::kAll &&
+      readback_mode != ReadbackResolveMode::kFast) {
     return;
   }
-  // A second, host-imported (guest RAM) buffer used only for memexport-touching
-  // draws while the main buffer stays fast device-local. Non-sparse, so it can
-  // accept host memory where the sparse buffer can't.
+  // A second, host-imported (guest RAM) buffer used for memexport-touching
+  // draws and non-UMA resolve readbacks while the main buffer stays fast
+  // device-local. Non-sparse, so it can accept host memory where the sparse
+  // buffer can't.
   if (!CreateImportedGuestRamBuffer(host_buffer_, host_buffer_memory_)) {
-    if (IsHostMapped()) {
-      XELOGI("Shared memory: guest RAM import unavailable - memexport uses "
-             "synchronous host-mapped readback");
-    } else {
-      XELOGW("Shared memory: memexport needs guest RAM import or a host-mapped "
-             "buffer (readback_resolve=uma)");
-    }
     host_buffer_ = VK_NULL_HANDLE;
     host_buffer_memory_ = VK_NULL_HANDLE;
     return;
   }
-  XELOGI("Shared memory: host buffer for memexport ranges ready");
+  XELOGI("Shared memory: host buffer for guest RAM import ready");
 }
 
 void VulkanSharedMemory::Shutdown(bool from_destructor) {

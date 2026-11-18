@@ -10,6 +10,7 @@
 #include "xenia/gpu/spirv_shader_translator.h"
 
 #include <cmath>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 #include <set>
@@ -239,9 +240,17 @@ namespace xe {
 namespace gpu {
 
 namespace {
-// Cache for auto-detected SPIR-V version to avoid re-testing on every
-// Features construction.
-static std::optional<spv::SpvVersion> g_cached_spirv_version;
+// Cache for auto-detected SPIR-V version keyed by device/driver identity so
+// switching Vulkan drivers at runtime on Android never reuses a version probed
+// on a different driver (e.g. Qualcomm 1.1 <-> Turnip 1.0 on Adreno 610).
+struct CachedSpirvVersion {
+  VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+  uint32_t api_version = 0;
+  uint32_t driver_version = 0;
+  spv::SpvVersion spirv_version = spv::Spv_1_0;
+};
+static std::mutex g_cached_spirv_version_mutex;
+static std::optional<CachedSpirvVersion> g_cached_spirv_version;
 
 // Tests if a SPIR-V version is supported by generating a minimal shader using
 // the same SpirvBuilder used at runtime for game shaders
@@ -364,24 +373,43 @@ SpirvShaderTranslator::Features::Features(
     spirv_version = spv::Spv_1_6;
     XELOGD("SPIR-V version override: 1.6");
   } else {
-    // Auto-detect based on actual driver support testing.
-    // Use cached result if already detected.
-    if (g_cached_spirv_version.has_value()) {
-      spirv_version = g_cached_spirv_version.value();
+    // Auto-detect bounded by the device's Vulkan API version (per
+    // VUID-VkShaderModuleCreateInfo-pCode-01379: SPIR-V 1.3 requires Vulkan 1.1,
+    // SPIR-V 1.4 requires VK_KHR_spirv_1_4 or Vulkan 1.2, SPIR-V 1.5 requires
+    // Vulkan 1.2).
+    const uint32_t device_api_version = vulkan_device->properties().apiVersion;
+    const uint32_t device_driver_version =
+        vulkan_device->properties().driverVersion;
+    const VkPhysicalDevice physical_device = vulkan_device->physical_device();
+    std::lock_guard<std::mutex> cache_lock(g_cached_spirv_version_mutex);
+    if (g_cached_spirv_version.has_value() &&
+        g_cached_spirv_version->physical_device == physical_device &&
+        g_cached_spirv_version->api_version == device_api_version &&
+        g_cached_spirv_version->driver_version == device_driver_version) {
+      spirv_version = g_cached_spirv_version->spirv_version;
     } else {
-      // Test SPIR-V 1.5, fall back to 1.0 if it fails.
-      XELOGI("Testing SPIR-V 1.5 support...");
-
-      if (TestSpirvVersionSupport(vulkan_device, spv::Spv_1_5)) {
+      if (device_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0) &&
+          TestSpirvVersionSupport(vulkan_device, spv::Spv_1_5)) {
         spirv_version = spv::Spv_1_5;
         XELOGI("SPIR-V 1.5 test: PASSED - using SPIR-V 1.5");
+      } else if (device_api_version >= VK_MAKE_API_VERSION(0, 1, 1, 0) &&
+                 vulkan_device->extensions().ext_1_2_KHR_spirv_1_4 &&
+                 TestSpirvVersionSupport(vulkan_device, spv::Spv_1_4)) {
+        spirv_version = spv::Spv_1_4;
+        XELOGI("SPIR-V 1.4 test: PASSED - using SPIR-V 1.4");
+      } else if (device_api_version >= VK_MAKE_API_VERSION(0, 1, 1, 0) &&
+                 TestSpirvVersionSupport(vulkan_device, spv::Spv_1_3)) {
+        spirv_version = spv::Spv_1_3;
+        XELOGI("SPIR-V 1.3 test: PASSED - using SPIR-V 1.3");
       } else {
         spirv_version = spv::Spv_1_0;
-        XELOGW("SPIR-V 1.5 test: FAILED - falling back to SPIR-V 1.0");
+        XELOGI("Using SPIR-V 1.0 (Vulkan API {}.{})",
+               VK_API_VERSION_MAJOR(device_api_version),
+               VK_API_VERSION_MINOR(device_api_version));
       }
-
-      // Cache the detected version
-      g_cached_spirv_version = static_cast<spv::SpvVersion>(spirv_version);
+      g_cached_spirv_version = CachedSpirvVersion{
+          physical_device, device_api_version, device_driver_version,
+          static_cast<spv::SpvVersion>(spirv_version)};
     }
   }
 }
@@ -3539,8 +3567,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
                                 spv::DecorationLocation, int(input_location));
         builder_->addDecoration(interpolator_per_vertex,
                                 spv::DecorationPerVertexKHR);
-        // Note: Centroid decoration is not applicable with PerVertexKHR since
-        // we're doing manual interpolation.
+        // Centroid can't be decorated here, the barycentrics are clamped to the
+        // triangle in main instead.
         main_interface_.push_back(interpolator_per_vertex);
         ++input_location;
       }
@@ -3882,6 +3910,8 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   // Using only bary.y and bary.z since we anchor on v0 (bary.x = 1 - y - z).
   spv::Id bary_y_vec4 = spv::NoResult;
   spv::Id bary_z_vec4 = spv::NoResult;
+  spv::Id bary_centroid_y_vec4 = spv::NoResult;
+  spv::Id bary_centroid_z_vec4 = spv::NoResult;
   if (use_barycentric_interpolation && interpolator_mask) {
     // Load barycentric coordinates once for all interpolators.
     spv::Id barycentric_coords =
@@ -3907,6 +3937,47 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     id_vector_temp_util_.push_back(bary_z);
     bary_z_vec4 =
         builder_->createCompositeConstruct(type_float4_, id_vector_temp_util_);
+
+    // A shader can only have one barycentric input, at the center here, so
+    // centroid interpolators clamp the weights to the triangle rather than
+    // extrapolate past its edges. Inside it, the weights are used as they are.
+    if (shader_modification.pixel.interpolators_centroid & interpolator_mask) {
+      std::array<spv::Id, 3> bary;
+      std::array<spv::Id, 3> bary_clamped;
+      spv::Id bary_outside = spv::NoResult;
+      for (uint32_t i = 0; i < 3; ++i) {
+        bary[i] = builder_->createCompositeExtract(barycentric_coords,
+                                                   type_float_, i);
+        bary_clamped[i] = builder_->createBinBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450FMax, bary[i],
+            const_float_0_);
+        spv::Id bary_negative = builder_->createBinOp(
+            spv::OpFOrdLessThan, type_bool_, bary[i], const_float_0_);
+        bary_outside = bary_outside != spv::NoResult
+                           ? builder_->createBinOp(spv::OpLogicalOr, type_bool_,
+                                                   bary_outside, bary_negative)
+                           : bary_negative;
+      }
+      spv::Id bary_clamped_sum = builder_->createBinOp(
+          spv::OpFAdd, type_float_,
+          builder_->createBinOp(spv::OpFAdd, type_float_, bary_clamped[0],
+                                bary_clamped[1]),
+          bary_clamped[2]);
+      std::array<spv::Id, 2> bary_centroid_vec4;
+      for (uint32_t i = 0; i < 2; ++i) {
+        id_vector_temp_util_.clear();
+        id_vector_temp_util_.resize(
+            4, builder_->createTriOp(
+                   spv::OpSelect, type_float_, bary_outside,
+                   builder_->createBinOp(spv::OpFDiv, type_float_,
+                                         bary_clamped[1 + i], bary_clamped_sum),
+                   bary[1 + i]));
+        bary_centroid_vec4[i] = builder_->createCompositeConstruct(
+            type_float4_, id_vector_temp_util_);
+      }
+      bary_centroid_y_vec4 = bary_centroid_vec4[0];
+      bary_centroid_z_vec4 = bary_centroid_vec4[1];
+    }
   }
 
   for (uint32_t i = 0; i < register_count(); ++i) {
@@ -3959,10 +4030,14 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
         spv::Id d2 = builder_->createBinOp(spv::OpFSub, type_float4_, v2, v0);
 
         // Compute: v0 + d1*bary.y + d2*bary.z
-        spv::Id term1 =
-            builder_->createBinOp(spv::OpFMul, type_float4_, d1, bary_y_vec4);
-        spv::Id term2 =
-            builder_->createBinOp(spv::OpFMul, type_float4_, d2, bary_z_vec4);
+        bool centroid = (shader_modification.pixel.interpolators_centroid &
+                         (UINT32_C(1) << i)) != 0;
+        spv::Id term1 = builder_->createBinOp(
+            spv::OpFMul, type_float4_, d1,
+            centroid ? bary_centroid_y_vec4 : bary_y_vec4);
+        spv::Id term2 = builder_->createBinOp(
+            spv::OpFMul, type_float4_, d2,
+            centroid ? bary_centroid_z_vec4 : bary_z_vec4);
         spv::Id sum_terms =
             builder_->createBinOp(spv::OpFAdd, type_float4_, term1, term2);
         interpolated_value =

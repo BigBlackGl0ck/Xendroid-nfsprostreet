@@ -6813,6 +6813,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         (pixel_shader && !stage_bindings_ready[1])) {
       if (!memexport_ranges_.empty()) {
         pipeline_wait_reason = "memexport";
+      } else if (configured_pipeline == VK_NULL_HANDLE &&
+                 !cvars::vulkan_async_skip_draws) {
+        pipeline_wait_reason = "async skip draws disabled";
       } else if (cvars::vulkan_async_wait_persistent_draws) {
         if (render_target_cache_->IsLastUpdateDrawTargetSmall()) {
           pipeline_wait_reason = "small render target";
@@ -6878,20 +6881,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   const bool placeholder_writes_no_color =
       configured_placeholder_bound &&
       !pipeline->placeholder_writes_color.load(std::memory_order_relaxed);
-  if (cvars::vulkan_placeholder_pipelines &&
-      current_pipeline == VK_NULL_HANDLE) {
-    // Placeholder mode: real pipeline not created yet and no placeholder -
-    // skip this draw rather than stalling the draw thread.
+  // Both placeholder mode and deferred-bind mode capture current_pipeline by
+  // value (ArgsVkBindPipelineDeferred drops VK_NULL_HANDLE at replay). Skip
+  // unready draws before uploading textures, entering render passes, or
+  // validating descriptor binding counts against an interim (0t/0s) layout.
+  if (current_pipeline == VK_NULL_HANDLE) {
     XELOGI("Draw skipped (pipeline not ready yet): VS {:016X}, PS {:016X}",
            vertex_shader->ucode_data_hash(),
            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
     return true;
   }
-  // Deferred-bind mode (cvar off): current_pipeline may legitimately be
-  // VK_NULL_HANDLE here - fall through and record a deferred bind of the
-  // stable slot pointer; EndSubmission waits (or replay drops it under
-  // vulkan_async_skip_draws). pipeline_layout is never null (the slot was
-  // created with at least the minimal layout).
   // The interpreter reads the guest ucode from shared memory by its program
   // address. A cached interpreter placeholder reused for an inline
   // (IM_LOAD_IMMEDIATE, address 0) shader can't be fed, so skip until the real
@@ -8228,9 +8227,17 @@ bool VulkanCommandProcessor::IssueCopy() {
   // copy branches below check resolve_host_buffer themselves. Gating the whole
   // block on it disabled readback outright wherever guest RAM cannot be
   // imported (no VK_EXT_external_memory_host, i.e. every Adreno).
-  const bool uma_direct = readback_mode == ReadbackResolveMode::kUma &&
-                          !texture_cache_->IsDrawResolutionScaled() &&
-                          shared_memory_->IsHostMapped();
+  // Without host-memory import, kAll and kFast also read the host-mapped device
+  // buffer directly, stalling when DecideResolveHostCopy requests synchronous
+  // current-frame coherency (fixes black/missing CPU-readback pitch in FIFA).
+  const bool mapped_sync_readback =
+      (readback_mode == ReadbackResolveMode::kAll ||
+       readback_mode == ReadbackResolveMode::kFast) &&
+      resolve_host_buffer == VK_NULL_HANDLE;
+  const bool uma_direct =
+      (readback_mode == ReadbackResolveMode::kUma || mapped_sync_readback) &&
+      !texture_cache_->IsDrawResolutionScaled() &&
+      shared_memory_->IsHostMapped();
   if (readback_mode != ReadbackResolveMode::kDisabled && written_length > 0 &&
       resolve_host_buffer == VK_NULL_HANDLE && !uma_direct) {
     static bool readback_unavailable_logged = false;
@@ -8253,10 +8260,8 @@ bool VulkanCommandProcessor::IssueCopy() {
       return true;
     }
 
-    // UMA: shared memory is host-mapped, so the CPU reads the resolved bytes
-    // straight out of it - no device->host copy at all. Serves the same role as
-    // upstream's zero_copy on devices that cannot import guest RAM. Kept
-    // selectable against kFast/kAll so the two designs can be compared.
+    // UMA / host-mapped fallback: shared memory is host-mapped, so the CPU
+    // reads the resolved bytes straight out of it without a GPU staging copy.
     if (uma_direct) {
       ++vk_frame_sync_stats_.rb_uma_direct;
       const uint64_t resolve_submission = GetCurrentSubmission();
@@ -8264,8 +8269,9 @@ bool VulkanCommandProcessor::IssueCopy() {
           MakeReadbackResolveKey(written_address, written_length);
       auto& last_write = uma_readback_last_write_[resolve_key];
       // readback_resolve_uma_read_watch: a range seeded before is copied
-      // again only once the CPU has read it.
-      if (cvars::readback_resolve_uma_read_watch &&
+      // again only once the CPU has read it (UMA mode only; DecideResolveHostCopy
+      // already handled kFast/kAll).
+      if (!mapped_sync_readback && cvars::readback_resolve_uma_read_watch &&
           written_length >=
               uint32_t(std::max(
                   cvars::readback_resolve_uma_read_watch_min_kb, 0)) *
@@ -8286,10 +8292,13 @@ bool VulkanCommandProcessor::IssueCopy() {
         }
       }
       bool do_read;
-      if (!last_write) {
-        ++vk_frame_sync_stats_.rb_uma_first_use;
-        // First resolve of this destination: guest RAM holds nothing yet, so
-        // make the just-recorded write host-visible and drain to read it now.
+      if ((mapped_sync_readback && stall_after_copy) || !last_write) {
+        if (!mapped_sync_readback) {
+          ++vk_frame_sync_stats_.rb_uma_first_use;
+        }
+        // Make the just-recorded write host-visible and drain to read it now
+        // (either first resolve of this destination in UMA mode, or synchronous
+        // current-resolve readback in kAll/kFast mode without host import).
         // Guest shader stages included: in-pass resolves write shared memory
         // from the fragment stage, not just compute/transfer.
         PushBufferMemoryBarrier(

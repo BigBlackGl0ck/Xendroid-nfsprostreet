@@ -934,6 +934,10 @@ bool VulkanPipelineCache::ConfigurePipeline(
   // counts read as 0 and this yields the minimal (no-texture) layout - it is
   // upgraded to the real layout by the creation thread after translation, or
   // by RefreshPipelineLayoutIfStale on an earlier cache hit.
+  // Translation state is read before the layout as a creation thread may finish
+  // a shader in between. A shader taken as translated then has its bindings in
+  // the layout.
+  const bool vertex_shader_translated = vertex_shader->is_translated();
   bool layout_counts_complete;
   const PipelineLayoutProvider* pipeline_layout =
       GetGuestGraphicsPipelineLayout(vertex_shader, pixel_shader,
@@ -1059,7 +1063,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
       // shaders) and is upgraded to the real one on the creation thread.
       pipeline_pair.second.uses_interpreter.store(use_interpreter,
                                                   std::memory_order_release);
-      bool make_placeholder = use_interpreter || vertex_shader->is_translated();
+      bool make_placeholder = use_interpreter || vertex_shader_translated;
       if (make_placeholder) {
         // Set is_placeholder BEFORE creating the pipeline to avoid a race with
         // the creation thread checking this flag.
@@ -1120,7 +1124,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
     } else {
       // Sync mode (no creation threads / async off / no pixel shader):
       // translate on this thread and create the pipeline immediately.
-      if (!vertex_shader->is_translated()) {
+      if (!layout_counts_complete) {
         if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
           return false;
         }
@@ -1167,7 +1171,22 @@ bool VulkanPipelineCache::ConfigurePipeline(
       }
       creation_request_cond_.notify_one();
     } else {
-      // Sync mode or no creation threads: create inline on the GPU thread.
+      // Sync mode or no creation threads: translate both stages and refresh the
+      // pipeline layout before creating inline on the GPU thread.
+      if (!layout_counts_complete) {
+        if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
+          return false;
+        }
+        const PipelineLayoutProvider* real_layout =
+            GetGuestGraphicsPipelineLayout(vertex_shader, pixel_shader);
+        if (!real_layout) {
+          return false;
+        }
+        pipeline_pair.second.pipeline_layout.store(real_layout,
+                                                   std::memory_order_release);
+        pipeline_pair.second.pipeline_layout_stale.store(
+            false, std::memory_order_release);
+      }
       if (!EnsurePipelineCreated(creation_arguments)) {
         pipeline_pair.second.creation_failed.store(true,
                                                    std::memory_order_release);
