@@ -535,15 +535,15 @@ spv::Id SpirvShaderTranslator::RoundTowardZero(spv::Id rounded, spv::Id error,
   };
 
   // Opposite signs mean the rounding went away from zero.
-  spv::Id step = builder_->createBinOp(
-      spv::OpLogicalAnd, type_bool,
-      compare(spv::OpFOrdNotEqual, error, const_zero),
-      builder_->createBinOp(spv::OpLogicalNotEqual, type_bool,
-                            compare(spv::OpFOrdLessThan, error, const_zero),
-                            compare(spv::OpFOrdLessThan, rounded, const_zero)));
-  step =
-      builder_->createBinOp(spv::OpLogicalAnd, type_bool, step,
-                            compare(spv::OpFOrdNotEqual, rounded, const_zero));
+  // Checking (rounded < 0 ? -error : error) < 0 covers both non-zero opposite
+  // sign cases without extra != 0 predicates: error == +-0 gives +-0 < 0
+  // (false), NaN gives false (ordered compare), and rounded == +-0 gives
+  // (+-0) * (1 - 2^-24) == +-0 with the exact sign preserved.
+  spv::Id rounded_neg = compare(spv::OpFOrdLessThan, rounded, const_zero);
+  spv::Id signed_error = builder_->createTriOp(
+      spv::OpSelect, type, rounded_neg,
+      builder_->createNoContractionUnaryOp(spv::OpFNegate, type, error), error);
+  spv::Id step = compare(spv::OpFOrdLessThan, signed_error, const_zero);
   // XenDroid: the step is float arithmetic, unlike upstream's select of the
   // bits minus 1. Mesa turns that select into an integer add of the bits, and
   // ir3 then folds the saturate of the guest instruction into the add as an
@@ -563,23 +563,25 @@ spv::Id SpirvShaderTranslator::RoundTowardZero(spv::Id rounded, spv::Id error,
           spv::OpSelect, type, step,
           splat(type, builder_->makeFloatConstant(1.0f - 0x1.0p-24f)),
           const_float_vectors_1_[component_count - 1]));
-  // Overflow from finite operands saturates, to the largest float with the
-  // sign of the infinity.
+  // Overflow from finite operands saturates to the largest float with the sign
+  // of the infinity. When |rounded| == INF, neither operand can be NaN, so
+  // max(|a|, |b|) < INF holds iff both operands were finite.
   spv::Id const_infinity = splat(type, builder_->makeFloatConstant(INFINITY));
+  spv::Id abs_max =
+      (a == b) ? absolute(a)
+               : builder_->createBinBuiltinCall(
+                     type, ext_inst_glsl_std_450_, GLSLstd450FMax, absolute(a),
+                     absolute(b));
   spv::Id overflowed = builder_->createBinOp(
       spv::OpLogicalAnd, type_bool,
       compare(spv::OpFOrdEqual, absolute(rounded), const_infinity),
-      builder_->createBinOp(
-          spv::OpLogicalAnd, type_bool,
-          compare(spv::OpFOrdNotEqual, absolute(a), const_infinity),
-          compare(spv::OpFOrdNotEqual, absolute(b), const_infinity)));
-  return builder_->createTriOp(
-      spv::OpSelect, type, overflowed,
-      builder_->createTriBuiltinCall(
-          type, ext_inst_glsl_std_450_, GLSLstd450FClamp, rounded,
-          splat(type, builder_->makeFloatConstant(-FLT_MAX)),
-          splat(type, builder_->makeFloatConstant(FLT_MAX))),
-      result);
+      compare(spv::OpFOrdLessThan, abs_max, const_infinity));
+  spv::Id clamped_overflow = builder_->createTriOp(
+      spv::OpSelect, type, rounded_neg,
+      splat(type, builder_->makeFloatConstant(-FLT_MAX)),
+      splat(type, builder_->makeFloatConstant(FLT_MAX)));
+  return builder_->createTriOp(spv::OpSelect, type, overflowed,
+                               clamped_overflow, result);
 }
 
 bool SpirvShaderTranslator::RoundsTowardZero() const {
@@ -657,12 +659,161 @@ spv::Id SpirvShaderTranslator::AluMultiply(spv::Id a, spv::Id b) {
   };
   spv::Id a_high, a_low, b_high, b_low;
   split(a, a_high, a_low);
-  split(b, b_high, b_low);
+  if (a == b) {
+    b_high = a_high;
+    b_low = a_low;
+  } else {
+    split(b, b_high, b_low);
+  }
   spv::Id error = sub(mul(a_high, b_high), product);
   error = add(error, mul(a_high, b_low));
   error = add(error, mul(a_low, b_high));
   error = add(error, mul(a_low, b_low));
   return RoundTowardZero(product, error, a, b);
+}
+
+spv::Id SpirvShaderTranslator::AluAddMasked(spv::Id a, spv::Id b,
+                                            uint32_t used_components,
+                                            uint32_t rtz_components) {
+  rtz_components &= used_components;
+  if (!RoundsTowardZero() || RoundsTowardZeroInHardware() || !rtz_components) {
+    return builder_->createNoContractionBinOp(spv::OpFAdd,
+                                              builder_->getTypeId(a), a, b);
+  }
+  if (rtz_components == used_components) {
+    return AluAdd(a, b);
+  }
+  spv::Id type = builder_->getTypeId(a);
+  spv::Id fast_result =
+      builder_->createNoContractionBinOp(spv::OpFAdd, type, a, b);
+  uint32_t used_count = xe::bit_count(used_components);
+  uint32_t rtz_count = xe::bit_count(rtz_components);
+  std::vector<unsigned int> sub_indices;
+  sub_indices.reserve(rtz_count);
+  uint32_t rem = used_components;
+  for (uint32_t i = 0; i < used_count; ++i) {
+    uint32_t comp;
+    xe::bit_scan_forward(rem, &comp);
+    rem &= ~(uint32_t(1) << comp);
+    if (rtz_components & (uint32_t(1) << comp)) {
+      sub_indices.push_back(i);
+    }
+  }
+  spv::Id sub_type = type_float_vectors_[rtz_count - 1];
+  spv::Id sub_a = rtz_count > 1
+                      ? builder_->createRvalueSwizzle(spv::NoPrecision,
+                                                      sub_type, a, sub_indices)
+                      : builder_->createCompositeExtract(a, sub_type,
+                                                         sub_indices[0]);
+  spv::Id sub_b = (b == a)
+                      ? sub_a
+                      : (rtz_count > 1
+                             ? builder_->createRvalueSwizzle(
+                                   spv::NoPrecision, sub_type, b, sub_indices)
+                             : builder_->createCompositeExtract(
+                                   b, sub_type, sub_indices[0]));
+  spv::Id sub_result = AluAdd(sub_a, sub_b);
+  if (rtz_count == 1) {
+    return builder_->createCompositeInsert(sub_result, fast_result, type,
+                                           sub_indices[0]);
+  }
+  std::unique_ptr<spv::Instruction> shuffle_op =
+      std::make_unique<spv::Instruction>(builder_->getUniqueId(), type,
+                                         spv::OpVectorShuffle);
+  shuffle_op->addIdOperand(fast_result);
+  shuffle_op->addIdOperand(sub_result);
+  rem = used_components;
+  unsigned int sub_shuffle_index = used_count;
+  for (uint32_t i = 0; i < used_count; ++i) {
+    uint32_t comp;
+    xe::bit_scan_forward(rem, &comp);
+    rem &= ~(uint32_t(1) << comp);
+    shuffle_op->addImmediateOperand((rtz_components & (uint32_t(1) << comp))
+                                        ? sub_shuffle_index++
+                                        : i);
+  }
+  spv::Id merged = shuffle_op->getResultId();
+  builder_->getBuildPoint()->addInstruction(std::move(shuffle_op));
+  return merged;
+}
+
+spv::Id SpirvShaderTranslator::AluSubtractMasked(spv::Id a, spv::Id b,
+                                                 uint32_t used_components,
+                                                 uint32_t rtz_components) {
+  rtz_components &= used_components;
+  if (!RoundsTowardZero() || RoundsTowardZeroInHardware() || !rtz_components) {
+    return builder_->createNoContractionBinOp(spv::OpFSub,
+                                              builder_->getTypeId(a), a, b);
+  }
+  return AluAddMasked(a,
+                      builder_->createNoContractionUnaryOp(
+                          spv::OpFNegate, builder_->getTypeId(b), b),
+                      used_components, rtz_components);
+}
+
+spv::Id SpirvShaderTranslator::AluMultiplyMasked(spv::Id a, spv::Id b,
+                                                 uint32_t used_components,
+                                                 uint32_t rtz_components) {
+  rtz_components &= used_components;
+  if (!RoundsTowardZero() || RoundsTowardZeroInHardware() || !rtz_components) {
+    return builder_->createNoContractionBinOp(spv::OpFMul,
+                                              builder_->getTypeId(a), a, b);
+  }
+  if (rtz_components == used_components) {
+    return AluMultiply(a, b);
+  }
+  spv::Id type = builder_->getTypeId(a);
+  spv::Id fast_result =
+      builder_->createNoContractionBinOp(spv::OpFMul, type, a, b);
+  uint32_t used_count = xe::bit_count(used_components);
+  uint32_t rtz_count = xe::bit_count(rtz_components);
+  std::vector<unsigned int> sub_indices;
+  sub_indices.reserve(rtz_count);
+  uint32_t rem = used_components;
+  for (uint32_t i = 0; i < used_count; ++i) {
+    uint32_t comp;
+    xe::bit_scan_forward(rem, &comp);
+    rem &= ~(uint32_t(1) << comp);
+    if (rtz_components & (uint32_t(1) << comp)) {
+      sub_indices.push_back(i);
+    }
+  }
+  spv::Id sub_type = type_float_vectors_[rtz_count - 1];
+  spv::Id sub_a = rtz_count > 1
+                      ? builder_->createRvalueSwizzle(spv::NoPrecision,
+                                                      sub_type, a, sub_indices)
+                      : builder_->createCompositeExtract(a, sub_type,
+                                                         sub_indices[0]);
+  spv::Id sub_b = (b == a)
+                      ? sub_a
+                      : (rtz_count > 1
+                             ? builder_->createRvalueSwizzle(
+                                   spv::NoPrecision, sub_type, b, sub_indices)
+                             : builder_->createCompositeExtract(
+                                   b, sub_type, sub_indices[0]));
+  spv::Id sub_result = AluMultiply(sub_a, sub_b);
+  if (rtz_count == 1) {
+    return builder_->createCompositeInsert(sub_result, fast_result, type,
+                                           sub_indices[0]);
+  }
+  std::unique_ptr<spv::Instruction> shuffle_op =
+      std::make_unique<spv::Instruction>(builder_->getUniqueId(), type,
+                                         spv::OpVectorShuffle);
+  shuffle_op->addIdOperand(fast_result);
+  shuffle_op->addIdOperand(sub_result);
+  rem = used_components;
+  unsigned int sub_shuffle_index = used_count;
+  for (uint32_t i = 0; i < used_count; ++i) {
+    uint32_t comp;
+    xe::bit_scan_forward(rem, &comp);
+    rem &= ~(uint32_t(1) << comp);
+    shuffle_op->addImmediateOperand((rtz_components & (uint32_t(1) << comp))
+                                        ? sub_shuffle_index++
+                                        : i);
+  }
+  spv::Id merged = shuffle_op->getResultId();
+  builder_->getBuildPoint()->addInstruction(std::move(shuffle_op));
+  return merged;
 }
 
 void SpirvShaderTranslator::KillPixel(
@@ -710,12 +861,15 @@ void SpirvShaderTranslator::ProcessAluInstruction(
   // Whether the instruction has changed the predicate, and it needs to be
   // checked again later.
   bool predicate_written_vector = false;
+  alu_vector_rounding_sensitive_components_ =
+      shader.GetAluVectorResultRoundingSensitiveComponents(instruction_address);
   alu_op_result_rounding_sensitive_ =
-      shader.IsAluVectorResultRoundingSensitive(instruction_address);
+      alu_vector_rounding_sensitive_components_ != 0;
   spv::Id vector_result = ProcessVectorAluOperation(
       instr, memexport_eM_potentially_written_before, predicate_written_vector);
 
   bool predicate_written_scalar = false;
+  alu_vector_rounding_sensitive_components_ = 0;
   alu_op_result_rounding_sensitive_ =
       shader.IsAluScalarResultRoundingSensitive(instruction_address);
   spv::Id scalar_result = ProcessScalarAluOperation(
@@ -810,13 +964,39 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
       static_cast<unsigned int>(spv::OpFOrdGreaterThanEqual),  // kMaxA
   };
 
+  auto get_exact_zero_mask = [](const InstructionOperand& op) -> uint32_t {
+    uint32_t mask = 0;
+    for (uint32_t c = 0; c < 4; ++c) {
+      if (op.GetComponent(c) == SwizzleSource::k0) {
+        mask |= uint32_t(1) << c;
+      }
+    }
+    return mask;
+  };
+  auto get_exact_zero_or_one_mask =
+      [](const InstructionOperand& op) -> uint32_t {
+    uint32_t mask = 0;
+    for (uint32_t c = 0; c < 4; ++c) {
+      SwizzleSource comp = op.GetComponent(c);
+      if (comp == SwizzleSource::k0 || comp == SwizzleSource::k1) {
+        mask |= uint32_t(1) << c;
+      }
+    }
+    return mask;
+  };
+
   switch (instr.vector_opcode) {
     case ucode::AluVectorOpcode::kAdd: {
-      return AluAdd(
+      uint32_t add_rtz_mask =
+          alu_vector_rounding_sensitive_components_ &
+          ~(get_exact_zero_mask(instr.vector_operands[0]) |
+            get_exact_zero_mask(instr.vector_operands[1]));
+      return AluAddMasked(
           GetOperandComponents(operand_storage[0], instr.vector_operands[0],
                                used_result_components),
           GetOperandComponents(operand_storage[1], instr.vector_operands[1],
-                               used_result_components));
+                               used_result_components),
+          used_result_components, add_rtz_mask);
     }
     case ucode::AluVectorOpcode::kMul:
     case ucode::AluVectorOpcode::kMad: {
@@ -826,7 +1006,12 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
             GetOperandComponents(operand_storage[i], instr.vector_operands[i],
                                  used_result_components);
       }
-      spv::Id result = AluMultiply(multiplicands[0], multiplicands[1]);
+      uint32_t mul_rtz_mask =
+          alu_vector_rounding_sensitive_components_ &
+          ~(get_exact_zero_or_one_mask(instr.vector_operands[0]) |
+            get_exact_zero_or_one_mask(instr.vector_operands[1]));
+      spv::Id result = AluMultiplyMasked(multiplicands[0], multiplicands[1],
+                                         used_result_components, mul_rtz_mask);
       uint32_t multiplicands_different =
           used_result_components &
           ~instr.vector_operands[0].GetIdenticalComponents(
@@ -942,9 +1127,14 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
       if (instr.vector_opcode == ucode::AluVectorOpcode::kMad) {
         // Not replacing true `0 + term` with conditional selection of the term
         // because +0 + -0 should result in +0, not -0.
-        result = AluAdd(result, GetOperandComponents(operand_storage[2],
-                                                     instr.vector_operands[2],
-                                                     used_result_components));
+        uint32_t add_rtz_mask =
+            alu_vector_rounding_sensitive_components_ &
+            ~get_exact_zero_mask(instr.vector_operands[2]);
+        result = AluAddMasked(
+            result,
+            GetOperandComponents(operand_storage[2], instr.vector_operands[2],
+                                 used_result_components),
+            used_result_components, add_rtz_mask);
       }
       return result;
     }
@@ -1096,9 +1286,15 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
           operand_storage[0], instr.vector_operands[0], used_result_components);
       if (instr.vector_opcode == ucode::AluVectorOpcode::kFrc &&
           RoundsTowardZero()) {
-        return AluSubtract(operand, builder_->createUnaryBuiltinCall(
-                                        result_type, ext_inst_glsl_std_450_,
-                                        GLSLstd450Floor, operand));
+        uint32_t frc_rtz_mask =
+            alu_vector_rounding_sensitive_components_ &
+            ~get_exact_zero_or_one_mask(instr.vector_operands[0]);
+        return AluSubtractMasked(
+            operand,
+            builder_->createUnaryBuiltinCall(result_type,
+                                             ext_inst_glsl_std_450_,
+                                             GLSLstd450Floor, operand),
+            used_result_components, frc_rtz_mask);
       }
       return builder_->createUnaryBuiltinCall(
           result_type, ext_inst_glsl_std_450_,
@@ -1480,7 +1676,12 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
             (used_result_components & 0b1000)
                 ? builder_->createCompositeExtract(operands[1], type_float_, 0)
                 : operands[1];
-        result_y = AluMultiply(operands_y[0], operands_y[1]);
+        uint32_t dst_y_rtz =
+            (alu_vector_rounding_sensitive_components_ & 0b0010) &
+            ~(get_exact_zero_or_one_mask(instr.vector_operands[0]) |
+              get_exact_zero_or_one_mask(instr.vector_operands[1]));
+        result_y = AluMultiplyMasked(operands_y[0], operands_y[1], 0b0010,
+                                     dst_y_rtz);
         if (!(instr.vector_operands[0].GetIdenticalComponents(
                   instr.vector_operands[1]) &
               0b0010)) {

@@ -69,6 +69,7 @@ enum class ZPDMode {
 
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
+ReadbackResolveMode GetReadbackResolveMode();
 
 // Shared pool capacity for D3D12 and Vulkan.
 constexpr uint32_t kZPDQueryPoolCapacity = 8192;
@@ -268,9 +269,12 @@ class CommandProcessor {
 
   TraceWriter& trace_writer() { return trace_writer_; }
 
-  // Get cached readback resolve mode (avoids string parsing every frame)
+  // Get cached readback resolve mode (avoids string parsing every frame; uses
+  // the shared atomic cache invalidated by InvalidateConfigModeCaches so
+  // per-game config and game_quirks overrides applied after CommandProcessor
+  // construction take effect immediately).
   ReadbackResolveMode GetReadbackResolveMode() const {
-    return cached_readback_resolve_mode_;
+    return xe::gpu::GetReadbackResolveMode();
   }
 
   // Set readback resolve mode (updates both cvar and cached value). With
