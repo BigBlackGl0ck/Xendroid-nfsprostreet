@@ -72,6 +72,9 @@
 #include "xenia/vfs/file.h"
 #include "xenia/vfs/virtual_file_system.h"
 #include "xenia/vfs/xex_metadata.h"
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+#include "xenia/vfs/saf_tree_device.h"
+#endif
 
 #if XE_PLATFORM_xendroid
 #include "third_party/zarchive/include/zarchive/zarchivecommon.h"
@@ -520,6 +523,29 @@ const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
     case FileSignatureType::XEX1:
     case FileSignatureType::XEX2:
     case FileSignatureType::ELF: {
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+      const std::string path_utf8 = xe::path_to_utf8(path);
+      if (vfs::saf::IsSafContentUri(path_utf8)) {
+        std::string parent_doc_id;
+        std::string leaf_name;
+        const bool has_parent = vfs::saf::DeriveSafParentDocumentId(
+            path_utf8, parent_doc_id, leaf_name);
+        auto xex = has_parent ? vfs::ExtractXexMetadata(path) : std::nullopt;
+        device = std::make_unique<vfs::SafTreeDevice>(
+            mount_path, path_utf8, has_parent ? parent_doc_id : std::string(),
+            xex && xex->RunsFromPackageOnly() ? "STFS" : "GDFX");
+        break;
+      }
+      std::error_code dir_ec;
+      if (std::filesystem::is_directory(path, dir_ec)) {
+        const auto default_xex = path / "default.xex";
+        auto xex = vfs::ExtractXexMetadata(default_xex);
+        device = std::make_unique<vfs::HostPathDevice>(
+            mount_path, path, !cvars::allow_game_relative_writes, false,
+            xex && xex->RunsFromPackageOnly() ? "STFS" : "GDFX");
+        break;
+      }
+#endif
       // An unpacked package's executable says where it came from, wherever
       // the files now are.
       auto xex = vfs::ExtractXexMetadata(path);
@@ -624,20 +650,103 @@ X_STATUS Emulator::MountPath(const std::filesystem::path& path,
 
 Emulator::FileSignatureType Emulator::GetFileSignature(
     const std::filesystem::path& path) {
+  constexpr int64_t header_size = 4;
+  char file_magic[header_size] = {};
+  char tail_magic[header_size] = {};
+  bool have_tail_magic = false;
+
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  const std::string path_utf8 = xe::path_to_utf8(path);
+  if (vfs::saf::IsSafContentUri(path_utf8)) {
+    const int fd = vfs::saf::OpenUriReadFd(path_utf8);
+    if (fd >= 0) {
+      struct stat st {};
+      const bool ok_stat = (::fstat(fd, &st) == 0 && !S_ISDIR(st.st_mode) &&
+                            st.st_size >= header_size);
+      bool ok_head = false;
+      if (ok_stat) {
+        ok_head = (::pread64(fd, file_magic, header_size, 0) == header_size);
+        if (::pread64(fd, tail_magic, header_size,
+                      static_cast<off64_t>(st.st_size - header_size)) ==
+            header_size) {
+          have_tail_magic = true;
+        }
+      }
+      ::close(fd);
+      if (ok_head) {
+        fourcc_t magic_value = make_fourcc(file_magic[0], file_magic[1],
+                                           file_magic[2], file_magic[3]);
+        switch (magic_value) {
+          case xe::cpu::kXEX1Signature:
+            return FileSignatureType::XEX1;
+          case xe::cpu::kXEX2Signature:
+            return FileSignatureType::XEX2;
+          case xe::vfs::kCONSignature:
+            return FileSignatureType::CON;
+          case xe::vfs::kLIVESignature:
+            return FileSignatureType::LIVE;
+          case xe::vfs::kPIRSSignature:
+            return FileSignatureType::PIRS;
+          case xe::vfs::kXSFSignature:
+            return FileSignatureType::XISO;
+          case xe::cpu::kElfSignature:
+            return FileSignatureType::ELF;
+          default:
+            break;
+        }
+        if (xe::kernel::kEXESignature ==
+            make_fourcc(file_magic[0], file_magic[1], 0, 0)) {
+          return FileSignatureType::EXE;
+        }
+        if (have_tail_magic &&
+            xe::vfs::kZarMagic == make_fourcc(tail_magic[0], tail_magic[1],
+                                              tail_magic[2], tail_magic[3])) {
+          return FileSignatureType::ZAR;
+        }
+        auto disc_dev = std::make_unique<vfs::DiscImageDevice>("", path);
+        if (disc_dev->Initialize()) {
+          return FileSignatureType::XISO;
+        }
+        return FileSignatureType::Unknown;
+      }
+    }
+    // SAF directory tree URI: probe for default.xex or any .xex at tree root.
+    auto children = vfs::saf::ListTreeChildren(path_utf8);
+    for (const auto& item : children) {
+      if (!item.is_directory &&
+          (utf8::equal_case(item.name, "default.xex") ||
+           (item.name.size() > 4 &&
+            utf8::equal_case(item.name.substr(item.name.size() - 4), ".xex")))) {
+        return FileSignatureType::XEX2;
+      }
+    }
+    return FileSignatureType::Unknown;
+  }
+
+  std::error_code dir_ec;
+  if (std::filesystem::is_directory(path, dir_ec)) {
+    const auto default_xex = path / "default.xex";
+    if (std::filesystem::exists(default_xex, dir_ec)) {
+      return GetFileSignature(default_xex);
+    }
+    return FileSignatureType::Unknown;
+  }
+#endif
+
   FILE* file = xe::filesystem::OpenFile(path, "rb");
 
   if (!file) {
     return FileSignatureType::Unknown;
   }
 
-  const uint64_t file_size = std::filesystem::file_size(path);
-  constexpr int64_t header_size = 4;
+  std::error_code fs_ec;
+  const uint64_t file_size = std::filesystem::file_size(path, fs_ec);
 
-  if (file_size < header_size) {
+  if (fs_ec || file_size < header_size) {
+    fclose(file);
     return FileSignatureType::Unknown;
   }
 
-  char file_magic[header_size];
   fread(file_magic, sizeof(file_magic), 1, file);
 
   fourcc_t magic_value =
@@ -760,11 +869,32 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
   // and then get that symlinked to game:\, so
   // -> game:\foo.xex
   // Get just the filename (foo.xex).
-  auto file_name = path.filename();
+  std::string file_name_utf8 = xe::path_to_utf8(path.filename());
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  const std::string path_utf8 = xe::path_to_utf8(path);
+  if (vfs::saf::IsSafContentUri(path_utf8)) {
+    std::string parent_doc_id;
+    std::string leaf_name;
+    if (vfs::saf::DeriveSafParentDocumentId(path_utf8, parent_doc_id,
+                                            leaf_name) &&
+        !leaf_name.empty()) {
+      file_name_utf8 = leaf_name;
+    } else {
+      file_name_utf8 =
+          cvars::launch_module.empty() ? "default.xex" : cvars::launch_module;
+    }
+  } else {
+    std::error_code dir_ec;
+    if (std::filesystem::is_directory(path, dir_ec)) {
+      file_name_utf8 =
+          cvars::launch_module.empty() ? "default.xex" : cvars::launch_module;
+    }
+  }
+#endif
 
   // Launch the game.
-  auto fs_path = fmt::format("{}\\", kDefaultGameSymbolicLink) +
-                 xe::path_to_utf8(file_name);
+  auto fs_path =
+      fmt::format("{}\\{}", kDefaultGameSymbolicLink, file_name_utf8);
   X_STATUS result = CompleteLaunch(path, fs_path);
 
   if (XFAILED(result)) {
@@ -1144,8 +1274,8 @@ X_STATUS Emulator::InstallContentPackage(
 
   vfs::VirtualFileSystem::ExtractContentHeader(device.get(), header_path);
 
-  // Lambda to handle cleanup - defined once, used in both cancellation paths
-  auto cleanup_and_fail = [&]() {
+  // Removes the partial install and reports the failure.
+  auto cleanup_and_fail = [&](X_STATUS result, std::string_view message) {
     std::error_code ec;
     bool cleanup_failed = false;
 
@@ -1165,16 +1295,16 @@ X_STATUS Emulator::InstallContentPackage(
 
     // Set state AFTER cleanup is done, so dialog doesn't pop up prematurely
     std::lock_guard<std::mutex> lock(*installation_info.mutex_);
-    installation_info.installation_result_ = X_ERROR_CANCELLED;
+    installation_info.installation_result_ = result;
     installation_info.installation_error_message_ =
-        cleanup_failed ? "Installation cancelled (cleanup failed)"
-                       : "Installation cancelled";
+        cleanup_failed ? fmt::format("{} (cleanup failed)", message)
+                       : std::string(message);
     installation_info.installation_state_ = InstallState::failed;
   };
 
   // Check for cancellation before extracting files
   if (installation_info.cancelled_.load()) {
-    cleanup_and_fail();
+    cleanup_and_fail(X_ERROR_CANCELLED, "Installation cancelled");
     return X_ERROR_CANCELLED;
   }
 
@@ -1185,13 +1315,15 @@ X_STATUS Emulator::InstallContentPackage(
 
   // Check for cancellation after extraction
   if (installation_info.cancelled_.load() || error_code == X_ERROR_CANCELLED) {
-    cleanup_and_fail();
+    cleanup_and_fail(X_ERROR_CANCELLED, "Installation cancelled");
     return X_ERROR_CANCELLED;
   }
 
+  // A partial install can't be used.
   if (error_code != X_ERROR_SUCCESS) {
-    std::lock_guard<std::mutex> lock(*installation_info.mutex_);
-    installation_info.installation_state_ = InstallState::failed;
+    cleanup_and_fail(error_code, error_code == X_STATUS_END_OF_FILE
+                                     ? "Package is damaged!"
+                                     : "Failed to extract package!");
     return error_code;
   }
 

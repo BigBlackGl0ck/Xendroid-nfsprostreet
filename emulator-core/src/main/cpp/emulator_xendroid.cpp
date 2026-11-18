@@ -46,6 +46,7 @@
 #include "xenia/vfs/stfs_metadata.h"                  // ExtractStfsMetadata(path)
 #include "xenia/vfs/content_install_standalone.h"     // InstallContentPackageStandalone
 #include "xenia/vfs/fatx_package_name.h"              // FatxPackageName
+#include "xenia/vfs/saf_tree_device.h"                // Android SAF tree + document FD VFS
 #include "xenia/kernel/xam/profile_standalone.h"       // CreateStandaloneProfile / ListStandaloneProfiles / RenameStandaloneProfile
 
 #include <cstdio>
@@ -67,6 +68,7 @@ std::vector<std::string> g_launch_args;
 std::string g_uri_info_list_file_path;
 std::string g_native_lib_dir;
 static void j_setup_context(JNIEnv* env,jobject self,jobject context ){
+    xe::vfs::saf::ScopedJniEnv::SetJavaVmFromEnv(env);
     g_context = env->NewGlobalRef(context);
     //getApplicationInfo().nativeLibraryDir;
     jmethodID mid_get_application_info = env->GetMethodID(env->GetObjectClass(context), "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
@@ -582,6 +584,23 @@ static jobject j_meta_from_path(JNIEnv* env, jobject self,
 
     switch (format) {
         case TID_FMT_XEX_FOLDER: {
+            const std::string p_utf8 = xe::path_to_utf8(p);
+            if (xe::vfs::saf::IsSafContentUri(p_utf8)) {
+                int fd = xe::vfs::saf::OpenUriReadFd(p_utf8);
+                if (fd >= 0) {
+                    auto mmap = xe::MappedMemory::OpenForUnixFd(fd);
+                    if (mmap) {
+                        meta = extract_xex_meta(mmap->data(), mmap->size());
+                    }
+                } else {
+                    xe::vfs::SafTreeDevice dev("\\Device\\Package_0", p_utf8);
+                    if (dev.Initialize()) {
+                        auto xex = read_vfs_entry_bytes(dev.ResolvePath("default.xex"));
+                        if (!xex.empty()) meta = extract_xex_meta(xex.data(), xex.size());
+                    }
+                }
+                break;
+            }
             // path already points at default.xex; mmap its bytes directly.
             std::unique_ptr<xe::MappedMemory> mmap =
                     xe::MappedMemory::Open(p, xe::MappedMemory::Mode::kRead);
@@ -2119,6 +2138,7 @@ static void j_disc_set_known(JNIEnv* env, jobject self, jobjectArray labels,
 }
 
 int register_xendroid_Emulator(JNIEnv* env){
+    xe::vfs::saf::ScopedJniEnv::SetJavaVmFromEnv(env);
 
     g_class_Emulator = env->FindClass("xendroid/compose/Emulator");
     g_class_Emulator = (jclass)env->NewGlobalRef(g_class_Emulator);
