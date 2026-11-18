@@ -87,6 +87,16 @@ DECLARE_bool(texture_gradient_exp_bias);
 
 DECLARE_bool(alu_round_toward_zero);
 
+DECLARE_bool(texture_point_snap);
+
+DECLARE_bool(force_depth_clamp);
+
+DECLARE_bool(spirv_texture_iscale_specialization);
+
+DECLARE_bool(vulkan_fable2_float24_depth);
+
+DECLARE_bool(vulkan_shared_memory_bda);
+
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
 
 #endif  // XENIA_GPU_GPU_FLAGS_H_

@@ -4245,20 +4245,26 @@ void SpirvShaderTranslator::FSI_AlphaToMask() {
         builder_->createOp(spv::OpPhi, type_uint_, id_vector_temp_);
   }
 
-  // For FBO mode, ensure gl_SampleMask output was created
-  // For depth-only shaders, we don't create gl_SampleMask, so skip
-  if (output_fragment_sample_mask_ == spv::NoResult) {
+  const bool samples_as_pixels =
+      !edram_fragment_shader_interlock_ && IsDrawSamplesAsPixels();
+
+  // For FBO mode, ensure gl_SampleMask output was created (or 2x2
+  // samples-as-pixels discard is active on a 1x host attachment).
+  // For depth-only shaders, we don't create gl_SampleMask, so skip.
+  if (output_fragment_sample_mask_ == spv::NoResult && !samples_as_pixels) {
     return;
   }
 
   // Initialize OMask to full coverage (in case alpha to mask is disabled).
   // gl_SampleMask is an array, so we need to access element [0].
-  id_vector_temp_.clear();
-  id_vector_temp_.push_back(builder_->makeIntConstant(0));
-  spv::Id sample_mask_element = builder_->createAccessChain(
-      spv::StorageClassOutput, output_fragment_sample_mask_, id_vector_temp_);
-  spv::Id full_coverage = builder_->makeIntConstant(-1);  // All bits set
-  builder_->createStore(full_coverage, sample_mask_element);
+  if (output_fragment_sample_mask_ != spv::NoResult) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(0));
+    spv::Id sample_mask_element = builder_->createAccessChain(
+        spv::StorageClassOutput, output_fragment_sample_mask_, id_vector_temp_);
+    spv::Id full_coverage = builder_->makeIntConstant(-1);  // All bits set
+    builder_->createStore(full_coverage, sample_mask_element);
+  }
 
   // Load alpha_to_mask constant and check if enabled.
   id_vector_temp_.clear();
@@ -4301,12 +4307,36 @@ void SpirvShaderTranslator::FSI_AlphaToMask() {
   spv::Id frag_y =
       builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, frag_y_float);
 
+  spv::Id dither_x = frag_x;
+  spv::Id dither_y = frag_y;
+  spv::Id samples_as_pixels_sample_index = spv::NoResult;
+  if (samples_as_pixels) {
+    // 4x MSAA stored as 2x2 host pixels: each 2x2 block is one guest pixel
+    // (dither offset uses guest pixel X/Y), and (X & 1, Y & 1) selects Xenos
+    // sample index (X & 1) << 1 | (Y & 1) (TL=0, BL=1, TR=2, BR=3).
+    spv::Id const_uint_1 = builder_->makeUintConstant(1);
+    spv::Id sample_y =
+        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, frag_y,
+                              const_uint_1);
+    spv::Id sample_x =
+        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, frag_x,
+                              const_uint_1);
+    samples_as_pixels_sample_index = builder_->createBinOp(
+        spv::OpBitwiseOr, type_uint_, sample_y,
+        builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, sample_x,
+                              const_uint_1));
+    dither_x = builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                                     frag_x, const_uint_1);
+    dither_y = builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                                     frag_y, const_uint_1);
+  }
+
   // Y & 1
-  spv::Id y_bit = builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, frag_y,
+  spv::Id y_bit = builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, dither_y,
                                         builder_->makeUintConstant(1));
 
   // (X & 1) << 1
-  spv::Id x_bit = builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, frag_x,
+  spv::Id x_bit = builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, dither_x,
                                         builder_->makeUintConstant(1));
   spv::Id x_bit_shifted =
       builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, x_bit,
@@ -4455,14 +4485,31 @@ void SpirvShaderTranslator::FSI_AlphaToMask() {
 
   // Write coverage to gl_SampleMask and discard if zero (FBO mode only).
   if (!edram_fragment_shader_interlock_) {
-    // Write to gl_SampleMask[0].
-    id_vector_temp_.clear();
-    id_vector_temp_.push_back(builder_->makeIntConstant(0));
-    spv::Id sample_mask_element = builder_->createAccessChain(
-        spv::StorageClassOutput, output_fragment_sample_mask_, id_vector_temp_);
-    spv::Id coverage_int =
-        builder_->createUnaryOp(spv::OpBitcast, type_int_, coverage_final);
-    builder_->createStore(coverage_int, sample_mask_element);
+    if (samples_as_pixels) {
+      // Extract this 2x2 subpixel's coverage bit when 4x MSAA is active.
+      spv::Id is_4x_samples_as_pixels = builder_->createBinOp(
+          spv::OpIEqual, type_bool_, msaa_samples,
+          builder_->makeUintConstant(2));
+      spv::Id pixel_sample_covered = builder_->createBinOp(
+          spv::OpBitwiseAnd, type_uint_,
+          builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                                coverage_final, samples_as_pixels_sample_index),
+          builder_->makeUintConstant(1));
+      coverage_final = builder_->createTriOp(
+          spv::OpSelect, type_uint_, is_4x_samples_as_pixels,
+          pixel_sample_covered, coverage_final);
+    }
+    // Write to gl_SampleMask[0] when present (non-2x2 FBO path).
+    if (output_fragment_sample_mask_ != spv::NoResult) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(0));
+      spv::Id sample_mask_element = builder_->createAccessChain(
+          spv::StorageClassOutput, output_fragment_sample_mask_,
+          id_vector_temp_);
+      spv::Id coverage_int =
+          builder_->createUnaryOp(spv::OpBitcast, type_int_, coverage_final);
+      builder_->createStore(coverage_int, sample_mask_element);
+    }
 
     // Discard fragment if coverage is zero.
     spv::Id coverage_zero =
