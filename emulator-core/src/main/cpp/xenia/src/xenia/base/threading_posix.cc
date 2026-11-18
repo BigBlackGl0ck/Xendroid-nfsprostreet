@@ -415,7 +415,6 @@ class PosixConditionBase {
 
   virtual WaitResult Wait(std::chrono::milliseconds timeout) {
     bool executed;
-    auto predicate = [this] { return this->signaled(); };
 #if XE_PLATFORM_MAC || XE_PLATFORM_xendroid
     // Standard locking (no robust mutex support / fork disables it).
     std::unique_lock<std::mutex> lock(mutex_);
@@ -430,6 +429,8 @@ class PosixConditionBase {
     }
     std::unique_lock<std::mutex> lock(mutex_, std::adopt_lock);
 #endif
+    const uint64_t pulses_at_entry = pulse_count();
+    auto predicate = [this, pulses_at_entry] { return ready(pulses_at_entry); };
     if (predicate()) {
       executed = true;
     } else {
@@ -527,6 +528,12 @@ class PosixConditionBase {
     }
 
     MultiWaitRegistration registration(handles);
+    // Taken once, so a pulse landing between polls still releases this wait.
+    std::vector<uint64_t> pulses_at_entry;
+    pulses_at_entry.reserve(handles.size());
+    for (auto* handle : handles) {
+      pulses_at_entry.push_back(handle->pulse_count());
+    }
 
     // For multiple handles, we need to poll since we can't wait on multiple
     // condition variables simultaneously. This is a limitation of the POSIX
@@ -604,7 +611,7 @@ class PosixConditionBase {
         // For wait_all, check if ALL are signaled.
         bool all_signaled = true;
         for (size_t i = 0; i < handles.size(); ++i) {
-          if (!handles[i]->signaled()) {
+          if (!handles[i]->ready(pulses_at_entry[i])) {
             all_signaled = false;
             break;
           }
@@ -616,7 +623,7 @@ class PosixConditionBase {
       } else {
         // For wait_any, check if ANY is signaled.
         for (size_t i = 0; i < handles.size(); ++i) {
-          if (handles[i]->signaled()) {
+          if (handles[i]->ready(pulses_at_entry[i])) {
             first_signaled = i;
             condition_met = true;
             break;
@@ -672,6 +679,16 @@ class PosixConditionBase {
 
  protected:
   [[nodiscard]] inline virtual bool signaled() const = 0;
+  // Pulses delivered so far. A caller already waiting when one lands is
+  // released even though the object reads unsignaled again.
+  [[nodiscard]] virtual uint64_t pulse_count() const { return 0; }
+  // Whether a waiter that saw a pulse may still take it. Read under mutex_.
+  [[nodiscard]] virtual bool pulse_unclaimed() const { return false; }
+  // Read under mutex_.
+  [[nodiscard]] bool ready(uint64_t pulses_at_entry) const {
+    return signaled() ||
+           (pulse_count() != pulses_at_entry && pulse_unclaimed());
+  }
   inline virtual void post_execution() = 0;
   // Threads currently inside a cond_ wait on this object. Guarded by mutex_
   // (the wait sites hold it on both sides of the park, so the counter is
@@ -727,6 +744,19 @@ class PosixCondition<Event> : public PosixConditionBase {
   void Reset() {
     auto lock = GuardedLock();
     signal_ = false;
+  }
+
+  // Releases the callers already waiting, only one of them for an auto-reset
+  // event, and leaves the event reset.
+  void Pulse() {
+    auto lock = GuardedLock();
+    signal_ = false;
+    if (!manual_reset_ && AutoResetEventHandoff() && ReleaseOneWaiterLocked()) {
+      return;
+    }
+    pulse_count_.fetch_add(1, std::memory_order_release);
+    pulse_unclaimed_ = true;
+    NotifyAll();
   }
 
   // NtQueryEvent. EVENT_TYPE: NotificationEvent = 0, SynchronizationEvent = 1.
@@ -788,7 +818,10 @@ class PosixCondition<Event> : public PosixConditionBase {
                         std::chrono::milliseconds timeout) {
     if (manual_reset_ || !AutoResetEventHandoff()) {
       // Plain latch; legacy auto-reset consumes on wake.
-      auto predicate = [this] { return signal_; };
+      const uint64_t pulses_at_entry = pulse_count();
+      auto predicate = [this, pulses_at_entry] {
+        return ready(pulses_at_entry);
+      };
       bool executed;
       if (predicate()) {
         executed = true;
@@ -802,9 +835,7 @@ class PosixCondition<Event> : public PosixConditionBase {
         }
       }
       if (executed) {
-        if (!manual_reset_) {
-          signal_ = false;
-        }
+        post_execution();
         return WaitResult::kSuccess;
       }
       return WaitResult::kTimeout;
@@ -886,15 +917,29 @@ class PosixCondition<Event> : public PosixConditionBase {
     }
     return signal_ && head_ == nullptr;
   }
+  [[nodiscard]] uint64_t pulse_count() const override {
+    return pulse_count_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] bool pulse_unclaimed() const override {
+    return manual_reset_ || pulse_unclaimed_;
+  }
   void post_execution() override {
-    if (!manual_reset_) {
+    if (manual_reset_) {
+      return;
+    }
+    if (signal_) {
       signal_ = false;
+    } else {
+      pulse_unclaimed_ = false;
     }
   }
   bool signal_;
   const bool manual_reset_;
   Waiter* head_ = nullptr;
   Waiter* tail_ = nullptr;
+  // Written under mutex_, atomic for the multi-wait snapshot taken without it.
+  std::atomic<uint64_t> pulse_count_{0};
+  bool pulse_unclaimed_ = false;
 };
 
 template <>
@@ -1844,13 +1889,7 @@ class PosixEvent final : public PosixConditionHandle<Event> {
   void Set() override { handle_.Signal(); }
   void Reset() override { handle_.Reset(); }
   EventInfo Query() override { return handle_.Query(); }
-  void Pulse() override {
-    using namespace std::chrono_literals;
-    handle_.Signal();
-    MaybeYield();
-    Sleep(10us);
-    handle_.Reset();
-  }
+  void Pulse() override { handle_.Pulse(); }
 };
 
 std::unique_ptr<Event> Event::CreateManualResetEvent(bool initial_state) {

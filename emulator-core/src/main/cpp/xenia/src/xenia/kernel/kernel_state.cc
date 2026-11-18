@@ -107,6 +107,7 @@ KernelState::~KernelState() {
   }
 
   executable_module_.reset();
+  pending_process_attaches_.clear();
   user_modules_.clear();
   kernel_modules_.clear();
 
@@ -777,8 +778,13 @@ object_ref<UserModule> KernelState::LoadUserModuleFromMemory(
 X_RESULT KernelState::FinishLoadingUserModule(
     const object_ref<UserModule> module, bool call_entry) {
   // TODO(Gliniak): Apply custom patches here
+  XThread* loader = XThread::GetCurrentThread();
   X_RESULT result = module->LoadContinue();
   if (XFAILED(result)) {
+    // Its imports may have loaded.
+    if (call_entry && loader) {
+      AttachPendingModules(loader, loader->thread_id());
+    }
     return result;
   }
   module->Dump();
@@ -789,7 +795,31 @@ X_RESULT KernelState::FinishLoadingUserModule(
     module->xex_module()->Precompile();
   }
 
-  if (module->is_dll_module() && module->entry_point() && call_entry) {
+  if (module->is_dll_module() && module->entry_point() &&
+      !module->is_attached()) {
+    auto global_lock = global_critical_region_.Acquire();
+    pending_process_attaches_.push_back(
+        {object_ref<UserModule>(module), loader ? loader->thread_id() : 0});
+  }
+  if (call_entry && loader) {
+    AttachPendingModules(loader, loader->thread_id());
+  }
+  return result;
+}
+
+void KernelState::AttachPendingModules(XThread* thread,
+                                       uint32_t loader_thread_id) {
+  auto global_lock = global_critical_region_.Acquire();
+  while (true) {
+    auto it = std::ranges::find(pending_process_attaches_, loader_thread_id,
+                                &PendingProcessAttach::loader_thread_id);
+    if (it == pending_process_attaches_.end()) {
+      return;
+    }
+    object_ref<UserModule> module = std::move(it->module);
+    pending_process_attaches_.erase(it);
+    global_lock.unlock();
+
     // Call DllMain(DLL_PROCESS_ATTACH):
     // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
     uint64_t args[] = {
@@ -797,14 +827,13 @@ X_RESULT KernelState::FinishLoadingUserModule(
         1,  // DLL_PROCESS_ATTACH
         0,  // 0 because always dynamic
     };
-
-    module->is_attached_ = true;
-
-    auto thread_state = XThread::GetCurrentThread()->thread_state();
-    processor()->Execute(thread_state, module->entry_point(), args,
+    processor()->Execute(thread->thread_state(), module->entry_point(), args,
                          xe::countof(args));
+
+    global_lock.lock();
+    // Threads that start while DllMain runs skip the module.
+    module->is_attached_ = true;
   }
-  return result;
 }
 
 X_RESULT KernelState::ApplyTitleUpdate(
@@ -1071,6 +1100,9 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
   assert_true(iter != user_modules_.end());  // Unloading an unregistered module
                                              // is probably really bad
   user_modules_.erase(iter);
+  std::erase_if(pending_process_attaches_, [&module](const auto& pending) {
+    return pending.module.get() == module.get();
+  });
 
   // Ensure this module was not somehow registered twice
   assert_true(std::find_if(user_modules_.begin(), user_modules_.end(),
@@ -1144,23 +1176,19 @@ void KernelState::OnThreadExecute(XThread* thread) {
   // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
   auto thread_state = thread->thread_state();
   for (auto user_module : user_modules_) {
-    if (user_module->is_dll_module() && user_module->entry_point()) {
+    if (user_module->is_dll_module() && user_module->entry_point() &&
+        user_module->is_attached()) {
       uint64_t args[] = {
           user_module->hmodule_ptr(),
-          user_module->is_attached()
-              ? static_cast<uint64_t>(2)   // DLL_THREAD_ATTACH - Used to call
-                                           // DLL for each thread created.
-              : static_cast<uint64_t>(1),  // DLL_PROCESS_ATTACH - Used only
-                                           // once for initialization.
-          0,                               // 0 because always dynamic
+          2,  // DLL_THREAD_ATTACH
+          0,  // 0 because always dynamic
       };
-
-      user_module->is_attached_ = true;
-
       processor()->Execute(thread_state, user_module->entry_point(), args,
                            xe::countof(args));
     }
   }
+  // Imports loaded with the title.
+  AttachPendingModules(thread, 0);
 }
 
 void KernelState::OnThreadExit(XThread* thread) {
@@ -1175,7 +1203,7 @@ void KernelState::OnThreadExit(XThread* thread) {
   const bool notifies_dlls = NotifiesDlls(thread);
   for (auto user_module : user_modules_) {
     if (notifies_dlls && user_module->is_dll_module() &&
-        user_module->entry_point()) {
+        user_module->entry_point() && user_module->is_attached()) {
       uint64_t args[] = {
           user_module->hmodule_ptr(),
           3,  // DLL_THREAD_DETACH
@@ -1634,20 +1662,27 @@ void KernelState::StartProcessorDpcThread(uint8_t cpu) {
   dpcs.started.store(true, std::memory_order_release);
 }
 
+std::deque<KernelState::QueuedDpc>::iterator KernelState::ProcessorDpcs::Find(
+    uint32_t dpc_ptr) {
+  return std::find_if(
+      queue.begin(), queue.end(),
+      [dpc_ptr](const QueuedDpc& entry) { return entry.dpc_ptr == dpc_ptr; });
+}
+
 bool KernelState::QueueProcessorDpc(uint8_t cpu, uint32_t dpc_ptr,
                                     uint32_t arg1, uint32_t arg2) {
   auto& dpcs = processor_dpcs_[cpu];
   {
     std::lock_guard lock(dpcs.lock);
-    if (std::find(dpcs.queue.begin(), dpcs.queue.end(), dpc_ptr) !=
-        dpcs.queue.end()) {
+    if (dpcs.Find(dpc_ptr) != dpcs.queue.end()) {
       return false;
     }
-    auto dpc = memory()->TranslateVirtual<XDPC*>(dpc_ptr);
-    dpc->arg1 = arg1;
-    dpc->arg2 = arg2;
-    dpcs.queue.push_back(dpc_ptr);
+    dpcs.queue.push_back({dpc_ptr, arg1, arg2});
   }
+  // Only the guest's copy, the runner takes the arguments from the queue.
+  auto dpc = memory()->TranslateVirtual<XDPC*>(dpc_ptr);
+  dpc->arg1 = arg1;
+  dpc->arg2 = arg2;
   dpcs.event->Set(0, false);
   return true;
 }
@@ -1658,14 +1693,13 @@ bool KernelState::IsProcessorDpcQueued(uint8_t cpu, uint32_t dpc_ptr) {
     return false;
   }
   std::lock_guard lock(dpcs.lock);
-  return std::find(dpcs.queue.begin(), dpcs.queue.end(), dpc_ptr) !=
-         dpcs.queue.end();
+  return dpcs.Find(dpc_ptr) != dpcs.queue.end();
 }
 
 bool KernelState::RemoveProcessorDpc(uint32_t dpc_ptr) {
   for (auto& dpcs : processor_dpcs_) {
     std::lock_guard lock(dpcs.lock);
-    auto it = std::find(dpcs.queue.begin(), dpcs.queue.end(), dpc_ptr);
+    auto it = dpcs.Find(dpc_ptr);
     if (it != dpcs.queue.end()) {
       dpcs.queue.erase(it);
       return true;
@@ -1684,20 +1718,17 @@ void KernelState::RunProcessorDpcs(uint8_t cpu) {
     while (true) {
       // Its arguments are taken as it leaves the queue, so KeInsertQueueDpc
       // may queue it again before it runs.
-      uint32_t dpc_ptr, arg1, arg2;
+      QueuedDpc entry;
       {
         std::lock_guard lock(dpcs.lock);
         if (dpcs.queue.empty()) {
           break;
         }
-        dpc_ptr = dpcs.queue.front();
+        entry = dpcs.queue.front();
         dpcs.queue.pop_front();
-        auto dpc = memory()->TranslateVirtual<XDPC*>(dpc_ptr);
-        arg1 = dpc->arg1;
-        arg2 = dpc->arg2;
       }
       const uint64_t started = Clock::host_tick_count_raw();
-      xboxkrnl::xeRunDpc(context, dpc_ptr, arg1, arg2);
+      xboxkrnl::xeRunDpc(context, entry.dpc_ptr, entry.arg1, entry.arg2);
       guest_scheduler_->NoteTargetedDpc(Clock::host_tick_count_raw() -
                                         started);
     }
