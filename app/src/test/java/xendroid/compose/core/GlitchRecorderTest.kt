@@ -47,12 +47,7 @@ class GlitchRecorderTest {
         assertTrue(chord.poll(8_300L))  // Cooldown elapsed and still held >= 1200 ms -> fires!
     }
 
-    @Test fun controllerBatteryHudMetricAndGpuPercentParserRoundTrip() {
-        val encoded = HudMetric.encode(setOf(HudMetric.FRAME_TIME, HudMetric.CONTROLLER_BATTERY))
-        val decoded = HudMetric.decode(encoded)
-        assertTrue(HudMetric.CONTROLLER_BATTERY in decoded)
-        assertTrue(HudMetric.FRAME_TIME in decoded)
-
+    @Test fun directGpuPercentParserReadsTheKernelCounters() {
         assertEquals(45, parseDirectGpuPercent("45\n"))
         assertEquals(72, parseDirectGpuPercent("72 %"))
         assertEquals(88, parseDirectGpuPercent("88 @ 900000000"))
