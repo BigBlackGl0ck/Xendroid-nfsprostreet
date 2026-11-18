@@ -33,6 +33,7 @@ for name in presentation_runtime_test pipeline_cache_file_test vblank_pacer_test
 done
 # C01: the crash record is a source file of its own (signal-handler code).
 "${cxx[@]}" "${flags[@]}" "$test/crash_record_test.cc" "$cpp/xe_crash_record.cpp" -o "$build/crash_record_test" "${dl[@]}"
+"${cxx[@]}" "${flags[@]}" "$test/string_key_test.cc" "$cpp/xenia/src/xenia/base/utf8.cc" -o "$build/string_key_test"
 "$build/presentation_runtime_test"
 "$build/pipeline_cache_file_test" "$build/pipeline-cache-scratch"
 "$build/vblank_pacer_test"
@@ -48,6 +49,7 @@ done
 "$build/draw_export_tracker_test"
 "$build/xam_live_signin_test"
 "$build/crash_record_test" "$build/crash-record-scratch"
+"$build/string_key_test"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then

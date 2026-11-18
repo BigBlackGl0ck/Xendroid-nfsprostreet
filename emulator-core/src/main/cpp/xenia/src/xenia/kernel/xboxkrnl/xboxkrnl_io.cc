@@ -148,10 +148,7 @@ static X_STATUS SubmitRequest(const object_ref<XFile>& file,
   };
   if (pends) {
     scheduler->NoteFileRequest(GuestScheduler::FileRequestEvent::kPended);
-    if (status_block) {
-      status_block->status = X_STATUS_PENDING;
-      status_block->information = 0;
-    }
+    // The status block is left alone until the request completes.
     file->PostIo(thread.get(),
                  [complete = std::move(complete)](bool cancelled) {
                    complete(true, cancelled);
