@@ -52,10 +52,12 @@
 #include "xenia/kernel/xam/profile_standalone.h"       // CreateStandaloneProfile / ListStandaloneProfiles / RenameStandaloneProfile
 
 #include <cstdio>
+#include <dlfcn.h>
 
 #include "cpuinfo.h"
 #include "vkapi.h"
 #include "vkutil.h"
+#include "third_party/libadrenotools/include/adrenotools/driver.h"
 
 //#include "cpptoml/include/cpptoml.h"
 
@@ -2187,6 +2189,207 @@ static void j_disc_set_known(JNIEnv* env, jobject self, jobjectArray labels,
     };
     xendroid::SetKnownDiscs(read(labels), read(paths));
 #endif
+}
+
+// Isolated `:driver_probe` process probe: opens a custom Vulkan ICD via
+// libadrenotools (on Adreno KGSL / namespace-isolated loaders) with fallback
+// to direct dlopen (for Arm Mali PanVK and Samsung Xclipse ICDs), and exercises
+// vkCreateInstance -> vkEnumeratePhysicalDevices -> vkCreateDevice -> teardown.
+extern "C" JNIEXPORT jstring JNICALL
+Java_xendroid_compose_driver_DriverProbeActivity_nativeProbeVulkanDriver(
+    JNIEnv* env, jclass /*cls*/, jstring j_driver_path) {
+    if (!j_driver_path) {
+        return env->NewStringUTF("ERR|Missing driver library path");
+    }
+    const char* raw_chars = env->GetStringUTFChars(j_driver_path, nullptr);
+    if (!raw_chars) {
+        return env->NewStringUTF("ERR|Out of memory reading driver path");
+    }
+    std::string custom_path(raw_chars);
+    env->ReleaseStringUTFChars(j_driver_path, raw_chars);
+
+    if (custom_path.empty() || !std::filesystem::exists(custom_path)) {
+        return env->NewStringUTF("ERR|Driver shared library does not exist");
+    }
+
+    const size_t slash = custom_path.find_last_of('/');
+    if (slash == std::string::npos) {
+        return env->NewStringUTF("ERR|Invalid driver path");
+    }
+    std::string custom_dir = custom_path.substr(0, slash + 1);
+    std::string custom_name = custom_path.substr(slash + 1);
+    std::string hook_dir = g_native_lib_dir.empty() ? custom_dir : (g_native_lib_dir + '/');
+
+    void* handle = nullptr;
+    bool opened_via_adrenotools = false;
+    if (std::filesystem::exists("/dev/kgsl-3d0")) {
+        handle = adrenotools_open_libvulkan(
+            RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, nullptr,
+            hook_dir.c_str(), custom_dir.c_str(), custom_name.c_str(),
+            nullptr, nullptr);
+        if (handle) opened_via_adrenotools = true;
+    }
+    if (!handle) {
+        handle = dlopen(custom_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!handle) {
+        const char* err = dlerror();
+        std::string msg = std::string("ERR|dlopen failed: ") + (err ? err : "unknown error");
+        return env->NewStringUTF(msg.c_str());
+    }
+
+    auto close_handle = [&]() {
+        if (handle) {
+            dlclose(handle);
+            handle = nullptr;
+        }
+        (void)opened_via_adrenotools;
+    };
+
+    auto get_inst_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        dlsym(handle, "vkGetInstanceProcAddr"));
+    if (!get_inst_proc) {
+        get_inst_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+            dlsym(handle, "vk_icdGetInstanceProcAddr"));
+    }
+    auto create_inst = get_inst_proc
+        ? reinterpret_cast<PFN_vkCreateInstance>(get_inst_proc(VK_NULL_HANDLE, "vkCreateInstance"))
+        : nullptr;
+    if (!create_inst) {
+        create_inst = reinterpret_cast<PFN_vkCreateInstance>(dlsym(handle, "vkCreateInstance"));
+    }
+    if (!create_inst || !get_inst_proc) {
+        close_handle();
+        return env->NewStringUTF("ERR|Missing vkGetInstanceProcAddr / vkCreateInstance entry point");
+    }
+
+    VkApplicationInfo app_info = {};
+    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pApplicationName = "xendroid-driver-probe";
+    app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    app_info.pEngineName = "xendroid";
+    app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    app_info.apiVersion = VK_API_VERSION_1_0;
+
+    VkInstanceCreateInfo inst_ci = {};
+    inst_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    inst_ci.pApplicationInfo = &app_info;
+
+    VkInstance instance = VK_NULL_HANDLE;
+    VkResult res = create_inst(&inst_ci, nullptr, &instance);
+    if (res != VK_SUCCESS || instance == VK_NULL_HANDLE) {
+        close_handle();
+        std::string msg = "ERR|vkCreateInstance failed (VkResult " + std::to_string(int(res)) + ")";
+        return env->NewStringUTF(msg.c_str());
+    }
+
+    auto destroy_inst = reinterpret_cast<PFN_vkDestroyInstance>(
+        get_inst_proc(instance, "vkDestroyInstance"));
+    auto enum_pdevs = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+        get_inst_proc(instance, "vkEnumeratePhysicalDevices"));
+    auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        get_inst_proc(instance, "vkGetPhysicalDeviceProperties"));
+    auto get_qprops = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+        get_inst_proc(instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+    auto create_dev = reinterpret_cast<PFN_vkCreateDevice>(
+        get_inst_proc(instance, "vkCreateDevice"));
+    auto get_dev_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+        get_inst_proc(instance, "vkGetDeviceProcAddr"));
+
+    if (!enum_pdevs || !get_props || !get_qprops || !create_dev) {
+        if (destroy_inst) destroy_inst(instance, nullptr);
+        close_handle();
+        return env->NewStringUTF("ERR|Incomplete Vulkan 1.0 instance dispatch table");
+    }
+
+    uint32_t pdev_count = 0;
+    if (enum_pdevs(instance, &pdev_count, nullptr) != VK_SUCCESS || pdev_count == 0) {
+        if (destroy_inst) destroy_inst(instance, nullptr);
+        close_handle();
+        return env->NewStringUTF("ERR|No compatible Vulkan physical device reported by driver");
+    }
+    std::vector<VkPhysicalDevice> pdevs(pdev_count);
+    if (enum_pdevs(instance, &pdev_count, pdevs.data()) != VK_SUCCESS || pdevs.empty()) {
+        if (destroy_inst) destroy_inst(instance, nullptr);
+        close_handle();
+        return env->NewStringUTF("ERR|vkEnumeratePhysicalDevices failed");
+    }
+
+    VkPhysicalDevice pdev = pdevs[0];
+    VkPhysicalDeviceProperties props = {};
+    get_props(pdev, &props);
+
+    uint32_t qcount = 0;
+    get_qprops(pdev, &qcount, nullptr);
+    if (qcount == 0) {
+        if (destroy_inst) destroy_inst(instance, nullptr);
+        close_handle();
+        return env->NewStringUTF("ERR|Driver reported zero Vulkan queue families");
+    }
+    std::vector<VkQueueFamilyProperties> qprops(qcount);
+    get_qprops(pdev, &qcount, qprops.data());
+
+    uint32_t chosen_q = 0;
+    for (uint32_t i = 0; i < qcount; ++i) {
+        if ((qprops[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+                (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT) &&
+            qprops[i].queueCount > 0) {
+            chosen_q = i;
+            break;
+        }
+    }
+
+    const float qprio = 1.0f;
+    VkDeviceQueueCreateInfo qci = {};
+    qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qci.queueFamilyIndex = chosen_q;
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &qprio;
+
+    VkDeviceCreateInfo dev_ci = {};
+    dev_ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dev_ci.queueCreateInfoCount = 1;
+    dev_ci.pQueueCreateInfos = &qci;
+
+    VkDevice device = VK_NULL_HANDLE;
+    VkResult dev_res = create_dev(pdev, &dev_ci, nullptr, &device);
+    if (dev_res != VK_SUCCESS || device == VK_NULL_HANDLE) {
+        if (destroy_inst) destroy_inst(instance, nullptr);
+        close_handle();
+        std::string msg = "ERR|vkCreateDevice failed (VkResult " + std::to_string(int(dev_res)) + ")";
+        return env->NewStringUTF(msg.c_str());
+    }
+
+    PFN_vkDestroyDevice destroy_dev = nullptr;
+    if (get_dev_proc) {
+        destroy_dev = reinterpret_cast<PFN_vkDestroyDevice>(
+            get_dev_proc(device, "vkDestroyDevice"));
+    }
+    if (!destroy_dev) {
+        destroy_dev = reinterpret_cast<PFN_vkDestroyDevice>(
+            get_inst_proc(instance, "vkDestroyDevice"));
+    }
+    if (destroy_dev) {
+        destroy_dev(device, nullptr);
+    }
+    if (destroy_inst) {
+        destroy_inst(instance, nullptr);
+    }
+    close_handle();
+
+    std::string device_name(props.deviceName);
+    for (char& ch : device_name) {
+        if (ch == '|' || ch == '\n' || ch == '\r') ch = ' ';
+    }
+    if (!is_well_formed_utf8(device_name)) {
+        device_name = "Vulkan GPU";
+    }
+    std::ostringstream ver;
+    ver << VK_VERSION_MAJOR(props.apiVersion) << "."
+        << VK_VERSION_MINOR(props.apiVersion) << "."
+        << VK_VERSION_PATCH(props.apiVersion);
+    std::string reply = "OK|" + device_name + "|" + ver.str();
+    return env->NewStringUTF(reply.c_str());
 }
 
 int register_xendroid_Emulator(JNIEnv* env){

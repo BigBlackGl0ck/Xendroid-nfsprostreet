@@ -49,6 +49,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.delay
 import xendroid.compose.R
+import xendroid.compose.companion.CompanionBluetooth
 import xendroid.compose.companion.CompanionPadLink.State
 import xendroid.compose.companion.CompanionPadLink.Why
 import xendroid.compose.companion.CompanionProtocol
@@ -90,7 +91,7 @@ fun PhoneControllerScreen(vm: PhoneControllerViewModel, onBack: () -> Unit) {
     }
     PhoneControllerForm(
         state = state,
-        address = vm.address.value, onAddress = { vm.address.value = it.take(21) },
+        address = vm.address.value, onAddress = { vm.address.value = it.take(26) },
         code = vm.code.value, onCode = { text -> vm.code.value = text.filter(Char::isDigit).take(6) },
         name = vm.name.value, onName = { vm.name.value = it.take(32) },
         intensity = vm.intensity.value, onIntensity = vm::setIntensity,
@@ -121,8 +122,23 @@ fun PhoneControllerForm(
         Column(Modifier.widthIn(max = 680.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             XdNote(stringResource(R.string.xd_pc_intro), tone = NoteTone.INFO, icon = XdIcons.info)
             XdCard(Modifier.fillMaxWidth()) {
+                val context = LocalContext.current
+                val btDevices = remember { CompanionBluetooth.pairedDevices(context) }
                 Field(stringResource(R.string.pc_address)) {
-                    Input(address, onAddress, "192.168.1.20:41234", !connecting, KeyboardType.Uri, mono = true)
+                    Input(address, onAddress, "192.168.1.20:41234 / bt://AA:BB:CC:DD:EE:FF", !connecting, KeyboardType.Uri, mono = true)
+                    if (btDevices.isNotEmpty()) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            for (dev in btDevices.take(3)) {
+                                XdButton(
+                                    dev.name.take(18),
+                                    { onAddress("bt://${dev.address}") },
+                                    kind = XdButtonKind.GHOST,
+                                    size = XdButtonSize.SM,
+                                    enabled = !connecting,
+                                )
+                            }
+                        }
+                    }
                 }
                 Field(stringResource(R.string.pc_code)) {
                     Input(code, onCode, "000000", !connecting, KeyboardType.NumberPassword, mono = true, big = true)
