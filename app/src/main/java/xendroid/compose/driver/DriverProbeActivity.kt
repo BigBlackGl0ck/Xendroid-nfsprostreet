@@ -31,7 +31,9 @@ class DriverProbeActivity : ComponentActivity() {
         }
         val outcome = try {
             EmulatorRuntime.ensureLoaded()
-            val raw = nativeProbeVulkanDriver(path)
+            EmulatorRuntime.emulator?.setup_context(applicationContext)
+            val nativeLibDir = applicationInfo?.nativeLibraryDir.orEmpty()
+            val raw = nativeProbeVulkanDriver(path, nativeLibDir)
             parseNativeProbeReply(raw)
         } catch (t: Throwable) {
             ProbeOutcome.Failed(t.message ?: t.javaClass.simpleName)
@@ -117,6 +119,6 @@ class DriverProbeActivity : ComponentActivity() {
         }
 
         @JvmStatic
-        private external fun nativeProbeVulkanDriver(driverPath: String): String
+        private external fun nativeProbeVulkanDriver(driverPath: String, nativeLibDir: String): String
     }
 }

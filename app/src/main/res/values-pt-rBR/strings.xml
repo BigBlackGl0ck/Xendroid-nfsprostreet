@@ -1362,4 +1362,5 @@
     <string name="pt_search_empty">Nenhum patch corresponde a este filtro.</string>
     <string name="pt_filter_enabled">Ativados</string>
     <string name="pt_filter_widescreen">Widescreen</string>
+    <string name="pc_bt_allow">Permitir dispositivos Bluetooth</string>
 </resources>

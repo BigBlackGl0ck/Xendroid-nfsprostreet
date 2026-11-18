@@ -532,6 +532,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             runCatching { controlOptions.update(change) }.onFailure { Log.w(TAG, "Saving the control options failed", it) }
         }
     }
+    private val btConnectPermLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        // Whether granted or denied, attempt starting phoneControllers (if denied, Status.Failed explains why).
+        if (phoneControllers.host == null && activeTitleState.value != null) {
+            phoneControllers.toggle()
+            refreshPhoneControllers()
+        }
+    }
     private val lsfgCache = mutableStateOf<String?>(null)
     private var importingLsfg = false
     private val lsfgPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -3518,6 +3525,19 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 // The native driver takes player slots only once the emulator runs a title.
                 if (phoneControllers.host == null && activeTitleState.value == null) {
                     Toast.makeText(this, getString(R.string.host_phone_wait), Toast.LENGTH_SHORT).show()
+                    return
+                }
+                // On Android 12+ (SDK >= 31), Bluetooth RFCOMM fallback needs runtime BLUETOOTH_CONNECT when no LAN is up.
+                if (phoneControllers.host == null &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    !xendroid.compose.companion.CompanionBluetooth.hasConnectPermission(this) &&
+                    runCatching {
+                        xendroid.compose.companion.CompanionNetwork.choose(
+                            xendroid.compose.companion.CompanionNetwork.candidates()
+                        )
+                    }.getOrNull() == null
+                ) {
+                    btConnectPermLauncher.launch(android.Manifest.permission.BLUETOOTH_CONNECT)
                     return
                 }
                 phoneControllers.toggle()

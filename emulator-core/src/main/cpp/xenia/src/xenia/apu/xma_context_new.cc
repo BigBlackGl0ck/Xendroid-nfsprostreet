@@ -54,14 +54,16 @@ inline void ConvertXmaFrameFloatToBe16(const uint8_t* const* samples,
   constexpr float kScale = 32767.0f;
 #if XE_ARCH_ARM64 || defined(__ARM_NEON)
   const auto* ch0 = reinterpret_cast<const float*>(samples[0]);
+  const float32x4_t zero_v = vdupq_n_f32(0.0f);
+  const float32x4_t neg_one_v = vdupq_n_f32(-1.0f);
+  const float32x4_t pos_one_v = vdupq_n_f32(1.0f);
   const float32x4_t scale_v = vdupq_n_f32(kScale);
-  const float32x4_t bound_v = vdupq_n_f32(2147483648.0f);
-  const int32x4_t min32_v = vdupq_n_s32(INT32_MIN);
 
   auto cvt_i32 = [&](float32x4_t f) -> int32x4_t {
-    const float32x4_t scaled = vmulq_f32(f, scale_v);
-    const uint32x4_t ok = vcaltq_f32(scaled, bound_v);
-    return vbslq_s32(ok, vcvtnq_s32_f32(scaled), min32_v);
+    const float32x4_t finite_or_inf = vbslq_f32(vceqq_f32(f, f), f, zero_v);
+    const float32x4_t clamped =
+        vminq_f32(vmaxq_f32(finite_or_inf, neg_one_v), pos_one_v);
+    return vcvtnq_s32_f32(vmulq_f32(clamped, scale_v));
   };
 
   if (is_two_channel && samples[1] != nullptr) {
@@ -103,7 +105,8 @@ inline void ConvertXmaFrameFloatToBe16(const uint8_t* const* samples,
   for (uint32_t i = 0; i < XmaContext::kSamplesPerFrame; ++i) {
     for (uint32_t ch = 0; ch <= uint32_t(interleave_two); ++ch) {
       const auto* in = reinterpret_cast<const float*>(samples[ch]);
-      const float scaled = xe::clamp_float(in[i], -1.0f, 1.0f) * kScale;
+      const float sample = std::isnan(in[i]) ? 0.0f : in[i];
+      const float scaled = xe::clamp_float(sample, -1.0f, 1.0f) * kScale;
       out[o++] = xe::byte_swap(static_cast<int16_t>(std::lrintf(scaled)));
     }
   }

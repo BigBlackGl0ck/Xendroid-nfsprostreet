@@ -2197,7 +2197,8 @@ static void j_disc_set_known(JNIEnv* env, jobject self, jobjectArray labels,
 // vkCreateInstance -> vkEnumeratePhysicalDevices -> vkCreateDevice -> teardown.
 extern "C" JNIEXPORT jstring JNICALL
 Java_xendroid_compose_driver_DriverProbeActivity_nativeProbeVulkanDriver(
-    JNIEnv* env, jclass /*cls*/, jstring j_driver_path) {
+    JNIEnv* env, jclass /*cls*/, jstring j_driver_path,
+    jstring j_native_lib_dir) {
     if (!j_driver_path) {
         return env->NewStringUTF("ERR|Missing driver library path");
     }
@@ -2207,6 +2208,14 @@ Java_xendroid_compose_driver_DriverProbeActivity_nativeProbeVulkanDriver(
     }
     std::string custom_path(raw_chars);
     env->ReleaseStringUTFChars(j_driver_path, raw_chars);
+
+    std::string passed_native_dir;
+    if (j_native_lib_dir) {
+        if (const char* nd = env->GetStringUTFChars(j_native_lib_dir, nullptr)) {
+            passed_native_dir = nd;
+            env->ReleaseStringUTFChars(j_native_lib_dir, nd);
+        }
+    }
 
     if (custom_path.empty() || !std::filesystem::exists(custom_path)) {
         return env->NewStringUTF("ERR|Driver shared library does not exist");
@@ -2218,17 +2227,26 @@ Java_xendroid_compose_driver_DriverProbeActivity_nativeProbeVulkanDriver(
     }
     std::string custom_dir = custom_path.substr(0, slash + 1);
     std::string custom_name = custom_path.substr(slash + 1);
-    std::string hook_dir = g_native_lib_dir.empty() ? custom_dir : (g_native_lib_dir + '/');
+    const std::string& resolved_native_dir =
+        !passed_native_dir.empty() ? passed_native_dir : g_native_lib_dir;
+    std::string hook_dir = resolved_native_dir.empty()
+                               ? custom_dir
+                               : (resolved_native_dir.back() == '/'
+                                      ? resolved_native_dir
+                                      : (resolved_native_dir + '/'));
 
-    void* handle = nullptr;
-    bool opened_via_adrenotools = false;
-    if (std::filesystem::exists("/dev/kgsl-3d0")) {
-        handle = adrenotools_open_libvulkan(
-            RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, nullptr,
-            hook_dir.c_str(), custom_dir.c_str(), custom_name.c_str(),
-            nullptr, nullptr);
-        if (handle) opened_via_adrenotools = true;
+    const bool has_kgsl = std::filesystem::exists("/dev/kgsl-3d0");
+    int driver_flags = ADRENOTOOLS_DRIVER_CUSTOM;
+    if (has_kgsl) {
+        driver_flags |= ADRENOTOOLS_DRIVER_CONTEXT_PRIORITY;
     }
+
+    // Attempt libadrenotools namespace-bridged loading first across all mobile
+    // GPU vendors (Adreno Turnip, Mali PanVK, Samsung Xclipse), matching
+    // VulkanInstance::Create, then fall back to direct dlopen.
+    void* handle = adrenotools_open_libvulkan(
+        RTLD_NOW, driver_flags, nullptr, hook_dir.c_str(),
+        custom_dir.c_str(), custom_name.c_str(), nullptr, nullptr);
     if (!handle) {
         handle = dlopen(custom_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     }
@@ -2243,7 +2261,6 @@ Java_xendroid_compose_driver_DriverProbeActivity_nativeProbeVulkanDriver(
             dlclose(handle);
             handle = nullptr;
         }
-        (void)opened_via_adrenotools;
     };
 
     auto get_inst_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(

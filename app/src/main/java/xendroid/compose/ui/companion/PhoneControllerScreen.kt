@@ -1,11 +1,15 @@
 package xendroid.compose.ui.companion
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
+import android.os.Build
 import android.view.HapticFeedbackConstants
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -123,10 +127,31 @@ fun PhoneControllerForm(
             XdNote(stringResource(R.string.xd_pc_intro), tone = NoteTone.INFO, icon = XdIcons.info)
             XdCard(Modifier.fillMaxWidth()) {
                 val context = LocalContext.current
-                val btDevices = remember { CompanionBluetooth.pairedDevices(context) }
+                var btPermGranted by remember { mutableStateOf(CompanionBluetooth.hasConnectPermission(context)) }
+                var connectAfterPerm by remember { mutableStateOf(false) }
+                val btPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                    btPermGranted = granted || CompanionBluetooth.hasConnectPermission(context)
+                    if (btPermGranted && connectAfterPerm) {
+                        connectAfterPerm = false
+                        onConnect()
+                    } else {
+                        connectAfterPerm = false
+                    }
+                }
+                val btDevices = remember(btPermGranted) {
+                    if (btPermGranted) CompanionBluetooth.pairedDevices(context) else emptyList()
+                }
                 Field(stringResource(R.string.pc_address)) {
                     Input(address, onAddress, "192.168.1.20:41234 / bt://AA:BB:CC:DD:EE:FF", !connecting, KeyboardType.Uri, mono = true)
-                    if (btDevices.isNotEmpty()) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !btPermGranted) {
+                        XdButton(
+                            stringResource(R.string.pc_bt_allow),
+                            { btPermLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) },
+                            kind = XdButtonKind.GHOST,
+                            size = XdButtonSize.SM,
+                            enabled = !connecting,
+                        )
+                    } else if (btDevices.isNotEmpty()) {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             for (dev in btDevices.take(3)) {
                                 XdButton(
@@ -157,7 +182,23 @@ fun PhoneControllerForm(
                         XdButton(stringResource(R.string.common_cancel), onCancel, kind = XdButtonKind.GHOST, size = XdButtonSize.SM)
                     }
                 } else {
-                    XdButton(stringResource(R.string.pc_connect), onConnect, Modifier.fillMaxWidth(), kind = XdButtonKind.PRIMARY, size = XdButtonSize.LG)
+                    XdButton(
+                        stringResource(R.string.pc_connect),
+                        {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                                !btPermGranted &&
+                                CompanionBluetooth.parseMac(address) != null
+                            ) {
+                                connectAfterPerm = true
+                                btPermLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+                            } else {
+                                onConnect()
+                            }
+                        },
+                        Modifier.fillMaxWidth(),
+                        kind = XdButtonKind.PRIMARY,
+                        size = XdButtonSize.LG,
+                    )
                 }
             }
             XdNote(stringResource(R.string.pc_footer), icon = XdIcons.lock)

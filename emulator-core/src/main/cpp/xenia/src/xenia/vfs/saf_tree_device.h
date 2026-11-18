@@ -703,10 +703,45 @@ class SafTreeEntry final : public Entry {
     if (fd < 0) {
       return nullptr;
     }
+#if XE_PLATFORM_xendroid
     auto whole = MappedMemory::OpenForUnixFd(fd);
     if (!whole) {
       return nullptr;
     }
+#else
+    struct stat64 st = {};
+    if (::fstat64(fd, &st) != 0 || st.st_size <= 0) {
+      ::close(fd);
+      return nullptr;
+    }
+    const size_t file_len = static_cast<size_t>(st.st_size);
+    void* mapped = ::mmap64(nullptr, file_len, PROT_READ, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (mapped == MAP_FAILED) {
+      return nullptr;
+    }
+    class DirectPosixMapped final : public MappedMemory {
+     public:
+      DirectPosixMapped(void* p, size_t len)
+          : MappedMemory(p, len), raw_(p), raw_len_(len) {}
+      ~DirectPosixMapped() override { Close(0); }
+      void Close(uint64_t /*truncate_size*/) override {
+        if (raw_) {
+          ::munmap(raw_, raw_len_);
+          raw_ = nullptr;
+          raw_len_ = 0;
+          data_ = nullptr;
+          size_ = 0;
+        }
+      }
+
+     private:
+      void* raw_;
+      size_t raw_len_;
+    };
+    std::unique_ptr<MappedMemory> whole =
+        std::make_unique<DirectPosixMapped>(mapped, file_len);
+#endif
     if (offset == 0 && (length == 0 || length >= whole->size())) {
       return whole;
     }
