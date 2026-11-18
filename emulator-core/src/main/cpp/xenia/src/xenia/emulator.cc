@@ -1865,22 +1865,6 @@ void Emulator::MountStandardDrives() {
         fs->RegisterSymbolicLink("cache1:", "\\CACHE1");
       }
     }
-
-    // Some (older?) games try accessing cache:\ too
-    // NOTE: this must be registered _after_ the cache0/cache1 devices, due to
-    // substring/start_with logic inside VirtualFileSystem::ResolvePath, else
-    // accesses to those devices will go here instead
-    auto cache_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE", storage_root_ / "cache", false);
-    if (!cache_device->Initialize()) {
-      XELOGE("Unable to scan cache path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache_device))) {
-        XELOGE("Unable to register cache path");
-      } else {
-        fs->RegisterSymbolicLink("cache:", "\\CACHE");
-      }
-    }
   }
 
   if (cvars::mount_memory_unit) {
@@ -1911,6 +1895,24 @@ void Emulator::MountStandardDrives() {
 
     fs->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
     fs->RegisterSymbolicLink("e:", "\\DEVKIT");
+  }
+}
+
+void Emulator::EmptyTitleCache() {
+  auto global_lock = global_critical_region::AcquireDirect();
+  vfs::Entry* root = file_system_->ResolvePath("\\CACHE");
+  if (!root) {
+    return;
+  }
+  std::vector<vfs::Entry*> children;
+  for (const auto& child : root->children()) {
+    children.push_back(child.get());
+  }
+  // Entries the title still has open stay.
+  for (vfs::Entry* child : children) {
+    if (!root->Delete(child)) {
+      XELOGW("Unable to delete cache:\\{} on format", child->name());
+    }
   }
 }
 
@@ -2490,7 +2492,9 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                      std::string("\\Cache1")};
   auto null_device =
       std::make_unique<vfs::NullDevice>("\\Device\\Harddisk0", null_paths);
+  vfs::NullDevice* raw_partitions = nullptr;
   if (null_device->Initialize()) {
+    raw_partitions = null_device.get();
     file_system_->RegisterDevice(std::move(null_device));
   }
 
@@ -2550,6 +2554,27 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     if (title_version.value != 0) {
       title_version_ = format_version(title_version);
     }
+  }
+
+  // XMountUtilityDrive creates \Device\cacheN on Harddisk0\CacheN and links
+  // cache: to it.
+  const auto cache_name = fmt::format("{:08X}", title_id_.value_or(0));
+  const auto cache_root = storage_root_ / "cache";
+  auto cache_device = std::make_unique<vfs::HostPathDevice>(
+      "\\CACHE", cache_root / cache_name, false);
+  if (cache_device->Initialize()) {
+    file_system_->RegisterDevice(std::move(cache_device));
+    file_system_->RegisterSymbolicLink("\\Device\\cache0", "\\CACHE");
+    file_system_->RegisterSymbolicLink("\\Device\\cache1", "\\CACHE");
+  } else {
+    XELOGE("Unable to scan the title's cache path");
+  }
+  // The cache table and cluster sizes sit beside the folder, as content
+  // package headers do.
+  if (raw_partitions) {
+    raw_partitions->LoadCacheHeader(cache_root / "Headers" /
+                                    (cache_name + ".header"));
+    raw_partitions->set_cache_format_handler([this]() { EmptyTitleCache(); });
   }
 
   // Before guest threads exist; quirks + per-game config already applied.
