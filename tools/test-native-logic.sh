@@ -54,9 +54,21 @@ done
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then
     xbase="$cpp/xenia/src/xenia/base"
+    xvfs="$cpp/xenia/src/xenia/vfs"
     "${cxx[@]}" "${flags[@]}" -DFMT_HEADER_ONLY "$test/threading_apc_test.cc" "$xbase/threading_posix.cc" \
         "$xbase/threading.cc" "$xbase/threading_timer_queue.cc" "$xbase/clock_posix.cc" -o "$build/threading_apc_test"
     "$build/threading_apc_test"
+    "${cxx[@]}" "${flags[@]}" -I "$cpp/xenia/third_party/fmt/include" -DFMT_HEADER_ONLY \
+        -ffunction-sections -fdata-sections -Wl,--gc-sections \
+        "$test/vfs_save_cache_test.cc" \
+        "$xvfs/virtual_file_system.cc" "$xvfs/device.cc" "$xvfs/entry.cc" \
+        "$xvfs/devices/host_path_device.cc" "$xvfs/devices/host_path_entry.cc" "$xvfs/devices/host_path_file.cc" \
+        "$xvfs/devices/null_device.cc" "$xvfs/devices/null_entry.cc" "$xvfs/devices/null_file.cc" \
+        "$xbase/filesystem.cc" "$xbase/filesystem_posix.cc" "$xbase/filesystem_wildcard.cc" \
+        "$xbase/mapped_memory_posix.cc" "$xbase/mutex.cc" "$xbase/string.cc" "$xbase/string_buffer.cc" \
+        "$xbase/utf8.cc" "$xbase/cvar.cc" "$xbase/clock_posix.cc" \
+        -o "$build/vfs_save_cache_test"
+    "$build/vfs_save_cache_test" "$build/vfs-save-cache-scratch"
 else
     echo "threading_apc_test: skipped (set XENDROID_NDK: it tests the Android build's code path)"
 fi
