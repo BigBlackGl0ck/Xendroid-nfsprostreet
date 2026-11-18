@@ -440,6 +440,11 @@ static const Quirk kQuirks[] = {
     // session (POCO F7, 2026-10-29).
     {0x555307E5, "guest_scheduler", false,
      "a new thread calls its routine before its creator stores it"},
+    // Fight Night Champion: Marketplace DLC packages stay locked even with
+    // license_mask = -1 unless the signed-in profile reports SignedInToLive
+    // with an online XUID and Live user flags/privileges (#132).
+    {0x45410915, "live_signin", true,
+     "DLCs require an Xbox Live-signed-in profile"},
 };
 
 // Same path/priority as a per-game config file.
