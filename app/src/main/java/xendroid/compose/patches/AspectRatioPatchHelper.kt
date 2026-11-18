@@ -15,7 +15,9 @@ object AspectRatioPatchHelper {
     enum class Preset(val label: String, val widthRatio: Float, val heightRatio: Float) {
         RATIO_19_5_9("19.5:9", 19.5f, 9f),
         RATIO_20_9("20:9", 20f, 9f),
-        RATIO_21_9("21:9", 21f, 9f),
+        // A "21:9" ultrawide panel is 2560x1080, i.e. 64:27 (2.3703704). The nominal
+        // 21:9 (2.3333333) belongs to 2520x1080 phones and produces the wrong stretch.
+        RATIO_21_9("21:9", 64f, 27f),
         ;
 
         val ratio: Float get() = widthRatio / heightRatio
