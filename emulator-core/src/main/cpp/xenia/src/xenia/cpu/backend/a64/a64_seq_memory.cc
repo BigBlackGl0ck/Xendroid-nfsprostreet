@@ -1735,13 +1735,32 @@ static void EmitNativeStoreConditional(A64Emitter& e, const I64Op& guest,
   e.ldar(e.w0, ptr(e.x2));
   e.cmp(e.w0, e.w4);
   e.bne(sc_fail);
-  e.mov(current, expected);
-  e.casal(current, value, ptr(e.x16));
-  e.cmp(current, expected);
-  e.bne(sc_fail);
+  if (e.IsFeatureEnabled(kA64EmitLSE)) {
+    e.mov(current, expected);
+    e.casal(current, value, ptr(e.x16));
+    e.cmp(current, expected);
+    e.bne(sc_fail);
+  } else {
+    auto& cas_retry = e.NewCachedLabel();
+    e.L(cas_retry);
+    e.ldaxr(current, ptr(e.x16));
+    e.cmp(current, expected);
+    e.bne(sc_fail_exclusive);
+    e.stlxr(e.w0, value, ptr(e.x16));
+    e.cbnz(e.w0, cas_retry);
+  }
   e.L(sc_stored);
-  e.mov(e.w0, 1);
-  e.staddl(e.w0, ptr(e.x2));
+  if (e.IsFeatureEnabled(kA64EmitLSE)) {
+    e.mov(e.w0, 1);
+    e.staddl(e.w0, ptr(e.x2));
+  } else {
+    auto& bump_retry = e.NewCachedLabel();
+    e.L(bump_retry);
+    e.ldxr(e.w0, ptr(e.x2));
+    e.add(e.w0, e.w0, 1);
+    e.stlxr(e.w4, e.w0, ptr(e.x2));
+    e.cbnz(e.w4, bump_retry);
+  }
   e.mov(dest, 1);
   e.b(sc_done);
   e.L(sc_fail_exclusive);
