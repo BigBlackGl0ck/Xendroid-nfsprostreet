@@ -15,7 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 X = os.path.join(REPO, "emulator-core/src/main/cpp/xenia")
 GEN = os.environ.get("XENIA_GENERATED_DIR") or next(iter(sorted(glob.glob(
-    os.path.join(REPO, "emulator-core/.cxx/Release/*/arm64-v8a/version.h")))),
+    os.path.join(REPO, "emulator-core/.cxx/*/*/arm64-v8a/version.h")))),
     "")
 GEN = os.path.dirname(GEN) if GEN.endswith("version.h") else GEN
 if not GEN or not os.path.isfile(os.path.join(GEN, "version.h")):
