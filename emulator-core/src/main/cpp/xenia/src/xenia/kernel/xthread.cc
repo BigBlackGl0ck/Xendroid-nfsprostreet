@@ -120,6 +120,9 @@ XThread::~XThread() {
     kernel_state()->memory()->SystemHeapFree(user_mode_->interrupt_frame);
     user_mode_.reset();
   }
+  for (const auto& dispatch : exception_dispatches_) {
+    kernel_state()->memory()->SystemHeapFree(dispatch.records);
+  }
 
   if (thread_state_) {
     delete thread_state_;
@@ -204,6 +207,21 @@ void XThread::set_name(const std::string_view name) {
     // One the thread is ready it will handle it.
     thread_->set_name(thread_name_);
   }
+}
+
+// Under the cooperative scheduler each guest CPU is one host core, so a title
+// whose threads never name a processor runs them all on its first thread's
+// core: each child stays on its parent's CPU (GetFakeCpuNumber). XNA titles are
+// such: the .NET runtime creates the game's threads without one, and every
+// Bastion thread started on CPU 0 while the other five idled. In a user mode
+// title (an XNA game: dynamic code on), a guest thread created without a
+// processor goes to the next CPU in turn instead, as its threads run in
+// parallel on PC, where xenia-edge gives each its own host thread. A processor
+// the title names, at creation or later (KeSetAffinityThread), is kept, and
+// other titles keep the console's rule.
+static uint8_t NextSpreadCpu() {
+  static std::atomic<uint32_t> next{0};
+  return static_cast<uint8_t>(next.fetch_add(1, std::memory_order_relaxed) % 6);
 }
 
 static uint8_t next_cpu = 0;
@@ -444,8 +462,12 @@ X_STATUS XThread::Create() {
   // Exports use this to get the kernel.
   thread_state_->context()->kernel_state = kernel_state_;
 
-  uint8_t cpu_index = GetFakeCpuNumber(
-      static_cast<uint8_t>(creation_params_.creation_flags >> 24));
+  const uint8_t proc_mask =
+      static_cast<uint8_t>(creation_params_.creation_flags >> 24);
+  const bool spread = !proc_mask && !is_host_thread() &&
+                      GuestScheduler::enabled() &&
+                      kernel_state()->processor()->dynamic_code_enabled();
+  uint8_t cpu_index = spread ? NextSpreadCpu() : GetFakeCpuNumber(proc_mask);
 
   // Initialize the KTHREAD object.
   InitializeGuestObject();
