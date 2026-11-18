@@ -81,6 +81,9 @@
 #include "third_party/zarchive/include/zarchive/zarchivereader.h"
 #include "third_party/zarchive/include/zarchive/zarchivewriter.h"
 #include "third_party/zarchive/src/sha_256.h"
+#if defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
 #endif
 
 #if XE_ARCH_AMD64
@@ -279,6 +282,7 @@ void Emulator::Shutdown() {
   title_version_.clear();
   game_info_database_.reset();
   paused_ = false;
+  Clock::HoldGuestTime(false);
 
   XELOGI("Emulator::Shutdown: teardown complete");
 }
@@ -1343,6 +1347,31 @@ X_STATUS Emulator::InstallContentPackage(
 }
 
 #if XE_PLATFORM_xendroid
+static uint32_t StreamCrc32Update(uint32_t crc, const uint8_t* data, size_t len) {
+  crc = ~crc;
+#if defined(__ARM_FEATURE_CRC32)
+  while (len >= 8) {
+    uint64_t word = 0;
+    std::memcpy(&word, data, sizeof(word));
+    crc = __crc32d(crc, word);
+    data += 8;
+    len -= 8;
+  }
+  while (len > 0) {
+    crc = __crc32b(crc, *data++);
+    --len;
+  }
+#else
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; ++b) {
+      crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+  }
+#endif
+  return ~crc;
+}
+
 // Re-open the produced .zar and confirm it reproduces the source disc walk:
 // the reader must open, and the enumerated file-count + total uncompressed
 // bytes must equal what the pack pass measured. Catches truncation /
@@ -1432,10 +1461,11 @@ X_STATUS Emulator::CompressDiscToZarchive(
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  std::vector<uint8_t> buffer(4 * 1024 * 1024);  // 4 MiB, like ExtractContentFile.
+  std::vector<uint8_t> buffer(4 * 1024 * 1024);  // 4 MiB, matching ZArchiveWriter batch.
   uint64_t total_files = 0;
   uint64_t total_bytes = 0;     // bytes actually read + appended into the archive
   uint64_t expected_bytes = 0;  // sum of the disc's declared file sizes (independent)
+  uint32_t source_crc32 = 0;    // hardware ARMv8 CRC32 across all packed stream bytes
 
   // Breadth-first walk of the mounted disc, mirroring ExtractContentFiles.
   vfs::Entry* root = device->ResolvePath("/");
@@ -1500,11 +1530,30 @@ X_STATUS Emulator::CompressDiscToZarchive(
       return X_STATUS_UNSUCCESSFUL;
     }
 
-    // Read via mmap fast-path or ReadSync, mirroring ExtractContentFile.
-    if (entry->can_map()) {
+    // Prefer streaming ReadSync so multi-GB files inside .iso / SVOD / .xex
+    // folders never require contiguous mmap; fall back to OpenMapped only if Open fails.
+    vfs::File* in = nullptr;
+    if (entry->Open(vfs::FileAccess::kFileReadData, &in) == X_STATUS_SUCCESS && in) {
+      size_t remaining = entry->size();
+      size_t offset = 0;
+      while (remaining > 0) {
+        size_t got = 0;
+        const size_t ask = std::min<size_t>(buffer.size(), remaining);
+        in->ReadSync(std::span<uint8_t>(buffer.data(), ask), offset, &got);
+        if (got == 0) {
+          break;
+        }
+        source_crc32 = StreamCrc32Update(source_crc32, buffer.data(), got);
+        zWriter.AppendData(buffer.data(), got);
+        offset += got;
+        remaining -= got;
+        total_bytes += got;
+        if (progress_done) progress_done->fetch_add(got);
+      }
+      in->Destroy();
+    } else if (entry->can_map()) {
       auto map = entry->OpenMapped(xe::MappedMemory::Mode::kRead);
       if (!map) {
-        // A 0-byte file is a valid empty archive entry, not a failure.
         if (entry->size() != 0) {
           XELOGI("Failed to map archive file {}\n", rel);
           return X_STATUS_UNSUCCESSFUL;
@@ -1514,6 +1563,7 @@ X_STATUS Emulator::CompressDiscToZarchive(
         size_t offset = 0;
         while (remaining > 0) {
           const size_t n = std::min<size_t>(buffer.size(), remaining);
+          source_crc32 = StreamCrc32Update(source_crc32, map->data() + offset, n);
           zWriter.AppendData(map->data() + offset, n);
           offset += n;
           remaining -= n;
@@ -1522,28 +1572,9 @@ X_STATUS Emulator::CompressDiscToZarchive(
         }
         map->Close();
       }
-    } else {
-      vfs::File* in = nullptr;
-      if (entry->Open(vfs::FileAccess::kFileReadData, &in) != X_STATUS_SUCCESS) {
-        XELOGI("Failed to open archive file {}\n", rel);
-        return X_STATUS_UNSUCCESSFUL;
-      }
-      size_t remaining = entry->size();
-      size_t offset = 0;
-      while (remaining > 0) {
-        size_t got = 0;
-        in->ReadSync(std::span<uint8_t>(buffer.data(), buffer.size()), offset,
-                     &got);
-        if (got == 0) {
-          break;  // short / truncated source -- verify will catch the mismatch.
-        }
-        zWriter.AppendData(buffer.data(), got);
-        offset += got;
-        remaining -= got;
-        total_bytes += got;
-        if (progress_done) progress_done->fetch_add(got);
-      }
-      in->Destroy();
+    } else if (entry->size() != 0) {
+      XELOGI("Failed to open archive file {}\n", rel);
+      return X_STATUS_UNSUCCESSFUL;
     }
 
     ++total_files;
@@ -1575,6 +1606,8 @@ X_STATUS Emulator::CompressDiscToZarchive(
     return X_STATUS_UNSUCCESSFUL;
   }
 
+  XELOGI("CompressDiscToZarchive: packed {} files ({} bytes, crc32={:08X}) -> {}",
+         total_files, total_bytes, source_crc32, xe::path_to_utf8(outputFile));
   return X_STATUS_SUCCESS;
 }
 #endif  // XE_PLATFORM_xendroid
@@ -1587,6 +1620,7 @@ void Emulator::Pause() {
   if (paused_.exchange(true)) {
     return;
   }
+  Clock::HoldGuestTime(true);
 
   // Soft pause: park the progress sources and let guest threads settle on
   // their own waits. Suspending threads mid-operation loses in-flight
@@ -1605,6 +1639,7 @@ void Emulator::Resume() {
   if (!paused_.exchange(false)) {
     return;
   }
+  Clock::HoldGuestTime(false);
   XELOGI("! EMULATOR RESUMED !");
 
   // Reverse of Pause().

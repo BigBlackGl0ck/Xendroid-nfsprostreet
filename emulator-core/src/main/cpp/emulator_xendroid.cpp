@@ -39,6 +39,8 @@
 
 #include "xenia/vfs/devices/disc_image_device.h"     // real-path DiscImageDevice (ISO)
 #include "xenia/vfs/devices/disc_zarchive_device.h"  // real-path DiscZarchiveDevice (.zar)
+#include "xenia/vfs/devices/host_path_device.h"      // extracted .xex folder -> .zar
+#include "xenia/vfs/devices/xcontent_container_device.h" // GOD / SVOD / STFS -> .zar
 #include "xenia/vfs/file.h"                           // vfs::File::ReadSync
 #include "xenia/vfs/iso_metadata.h"                   // ExtractIsoMetadata(path)
 #include "xenia/vfs/zar_metadata.h"                   // ExtractZarMetadata(path)
@@ -1577,19 +1579,69 @@ static jint j_compressIsoToZar(JNIEnv* env, jobject self, jstring isoPath,
     env->ReleaseStringUTFChars(isoPath, ip);
     env->ReleaseStringUTFChars(outZarPath, op);
 
-    // Mount the ISO from its real host path via the core real-path DiscImageDevice.
-    // RAII frees the mmap on scope exit; the device walk stays entirely native.
-    auto dev = std::make_unique<xe::vfs::DiscImageDevice>("\\Device\\Cdrom0", in);
-    if (!dev->Initialize()) return (jint)X_STATUS_UNSUCCESSFUL;  // not XDVDFS / corrupt
+    // Multi-format VFS mount for .zar compression:
+    // 1) Extracted .xex folder (directory path, path to default.xex, or SAF tree)
+    // 2) GOD / SVOD / STFS container (XContentContainerDevice)
+    // 3) .iso / XISO disc image (DiscImageDevice via pread64)
+    std::unique_ptr<xe::vfs::Device> dev;
+    const std::string in_utf8 = xe::path_to_utf8(in);
+    std::error_code in_ec;
+
+    if (xe::vfs::saf::IsSafContentUri(in_utf8)) {
+        if (xe::vfs::XContentContainerDevice::IsContainerFile(in)) {
+            dev = xe::vfs::XContentContainerDevice::CreateContentDevice("\\Device\\Cdrom0", in);
+            if (dev && !dev->Initialize()) dev.reset();
+        }
+        if (!dev) {
+            auto iso_dev = std::make_unique<xe::vfs::DiscImageDevice>("\\Device\\Cdrom0", in);
+            if (iso_dev->Initialize()) {
+                dev = std::move(iso_dev);
+            }
+        }
+        if (!dev) {
+            std::string parent_doc_id;
+            std::string leaf_name;
+            const bool has_parent = xe::vfs::saf::DeriveSafParentDocumentId(
+                    in_utf8, parent_doc_id, leaf_name);
+            auto saf_dev = std::make_unique<xe::vfs::SafTreeDevice>(
+                    "\\Device\\Cdrom0", in_utf8, has_parent ? parent_doc_id : std::string());
+            if (saf_dev->Initialize()) {
+                dev = std::move(saf_dev);
+            }
+        }
+    } else if (std::filesystem::is_directory(in, in_ec)) {
+        auto host_dev = std::make_unique<xe::vfs::HostPathDevice>("\\Device\\Cdrom0", in, true);
+        if (host_dev->Initialize()) {
+            dev = std::move(host_dev);
+        }
+    } else {
+        if (xe::utf8::equal_case(xe::path_to_utf8(in.extension()), ".xex")) {
+            auto host_dev = std::make_unique<xe::vfs::HostPathDevice>(
+                    "\\Device\\Cdrom0", in.parent_path(), true);
+            if (host_dev->Initialize()) {
+                dev = std::move(host_dev);
+            }
+        } else if (xe::vfs::XContentContainerDevice::IsContainerFile(in)) {
+            dev = xe::vfs::XContentContainerDevice::CreateContentDevice("\\Device\\Cdrom0", in);
+            if (dev && !dev->Initialize()) dev.reset();
+        } else {
+            auto iso_dev = std::make_unique<xe::vfs::DiscImageDevice>("\\Device\\Cdrom0", in);
+            if (iso_dev->Initialize()) {
+                dev = std::move(iso_dev);
+            }
+        }
+    }
+
+    if (!dev) return (jint)X_STATUS_UNSUCCESSFUL;
 
     // Transient emulator: the zar ops touch no runtime state -- same pattern as
     // the metadata probes. It never boots a title.
     auto emulator = std::make_unique<xe::Emulator>("", "", "", "");
-    g_zar_progress_total.store(0);  // reset so the getter reads 0 until the pre-walk
+    g_zar_progress_total.store(0);
     g_zar_progress_done.store(0);
     xe::X_STATUS s = emulator->CompressDiscToZarchive(
             dev.get(), out, &g_zar_progress_done, &g_zar_progress_total);
-    return (jint)s;  // dev (mmap) freed here on scope exit
+    return (jint)s;
 #else
     return (jint)X_STATUS_UNSUCCESSFUL;
 #endif
