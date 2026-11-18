@@ -52,22 +52,22 @@ DEFINE_bool(guest_display_refresh_cap, true,
             "GPU");
 
 DEFINE_bool(
-    wait_reg_mem_backoff, false,
+    wait_reg_mem_backoff, true,
     "Re-check an unmet PM4_WAIT_REG_MEM condition after short sleeps growing "
     "from 50 us up to the guest-requested poll interval, instead of sleeping "
-    "the whole interval (1 ms or more) before every re-check. Only helps when "
-    "the guest satisfies such waits within a fraction of the interval. "
-    "Measured neutral on Forza Horizon (POCO F7): of ~170 waits per frame "
-    "fewer than one is unmet on the first check, and that one genuinely "
-    "lasts ~7 ms either way (see the GpuFrame wait_reg_mem stats).",
+    "the whole interval (1 ms or more) before every re-check. Helps when the "
+    "guest CPU satisfies waits within a fraction of the interval without "
+    "hurting titles that genuinely wait longer.",
     "GPU");
+UPDATE_from_bool(wait_reg_mem_backoff, 2026, 11, 18, 21, false);
 DEFINE_int32(
-    wait_reg_mem_backoff_max_us, 0,
+    wait_reg_mem_backoff_max_us, 200,
     "With wait_reg_mem_backoff: the longest sleep between the re-checks, in "
     "microseconds (0: up to the guest-requested interval). A short one sees "
     "the guest CPU's write sooner. Read per wait "
     "(debug.xendroid.wrm_max_us on Android).",
     "GPU");
+UPDATE_from_int32(wait_reg_mem_backoff_max_us, 2026, 11, 18, 21, 0);
 
 DEFINE_uint32(
     framerate_limit, 60,

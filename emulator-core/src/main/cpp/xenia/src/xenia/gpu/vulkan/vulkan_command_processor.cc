@@ -218,7 +218,7 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
-    vulkan_depth_4x_as_1x, false,
+    vulkan_depth_4x_as_1x, true,
     "Host render target path: render the guest's 4x MSAA depth-only draws into "
     "surfaces never drawn with color - a title's own trick for fast depth "
     "clears and double-resolution depth, like the shadow atlas of Forza "
@@ -231,6 +231,7 @@ DEFINE_bool(
     "Not with resolution scaling. Can be switched at runtime "
     "(debug.xendroid.depth_4x_as_1x).",
     "GPU");
+UPDATE_from_bool(vulkan_depth_4x_as_1x, 2026, 11, 18, 21, false);
 
 DEFINE_int32(
     vulkan_shading_rate, 0,
@@ -243,7 +244,7 @@ DEFINE_int32(
     "GPU");
 
 DEFINE_bool(
-    vulkan_samples_as_pixels_simple_ps, false,
+    vulkan_samples_as_pixels_simple_ps, true,
     "With vulkan_depth_4x_as_1x: also render 4x MSAA draws whose pixel shader "
     "reads no textures, gradients or position into the 1x surface of their "
     "samples, and don't count their color as making a depth surface a "
@@ -255,6 +256,7 @@ DEFINE_bool(
     "centers otherwise. Can be switched at runtime "
     "(debug.xendroid.samples_as_pixels_ps).",
     "GPU");
+UPDATE_from_bool(vulkan_samples_as_pixels_simple_ps, 2026, 11, 18, 21, false);
 
 DEFINE_bool(
     vulkan_samples_as_pixels_coarse, false,
@@ -444,7 +446,7 @@ DEFINE_bool(
     "Vulkan");
 
 DEFINE_bool(
-    vulkan_memexport_barriers_by_range, false,
+    vulkan_memexport_barriers_by_range, true,
     "Shared memory barriers between guest draws with memory export only where "
     "a draw reads or writes what an earlier one has exported, or writes what "
     "an earlier one has read, instead of after each exporting draw, whatever "
@@ -454,6 +456,7 @@ DEFINE_bool(
     "right before it has exported. Can be switched at runtime "
     "(debug.xendroid.memexport_barriers).",
     "Vulkan");
+UPDATE_from_bool(vulkan_memexport_barriers_by_range, 2026, 11, 18, 21, false);
 
 DEFINE_int32(
     vulkan_debug_extra_pass_breaks, 0,

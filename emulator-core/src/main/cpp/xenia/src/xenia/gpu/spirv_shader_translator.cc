@@ -61,7 +61,7 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
-    spirv_structured_forward_jumps, false,
+    spirv_structured_forward_jumps, true,
     "Translate forward jumps of the shader microcode, where they nest like the "
     "if and else they usually come from, as if and else - instead of a loop "
     "iteration and a dispatch through a switch over all the labels of the "
@@ -70,6 +70,7 @@ DEFINE_bool(
     "in each of 14 iterations of a loop, over 28 labels. Takes effect for "
     "shaders translated afterwards.",
     "GPU");
+UPDATE_from_bool(spirv_structured_forward_jumps, 2026, 11, 18, 21, false);
 
 DEFINE_bool(
     spirv_switch_case_jump_fallthrough, false,
@@ -120,7 +121,7 @@ DEFINE_int32(
     "GPU");
 
 DEFINE_int32(
-    spirv_vs_relaxed_math, 0,
+    spirv_vs_relaxed_math, 1,
     "Skip parts of the Xenos math emulation in vertex shaders, like "
     "spirv_ps_relaxed_math in pixel shaders. Bit mask, read when shaders are "
     "translated (startup): 1 - no Shader Model 3 '0 * anything = 0' in "
@@ -133,6 +134,7 @@ DEFINE_int32(
     "the same position computed by different shaders may stop matching "
     "between passes (depth fighting).",
     "GPU");
+UPDATE_from_int32(spirv_vs_relaxed_math, 2026, 11, 18, 21, 0);
 
 DEFINE_bool(
     spirv_texture_sign_branch, true,
@@ -178,7 +180,7 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
-    spirv_texture_implicit_lod, false,
+    spirv_texture_implicit_lod, true,
     "Sample 2D textures with the LOD the host computes (implicit LOD plus "
     "the guest's LOD bias) instead of passing coarse derivatives scaled by "
     "2^bias as explicit gradients - the same LOD where the derivatives are "
@@ -188,6 +190,7 @@ DEFINE_bool(
     "gradient exponent biases (texture_gradient_exp_bias) keep the "
     "gradients. Read when shaders are translated (startup).",
     "GPU");
+UPDATE_from_bool(spirv_texture_implicit_lod, 2026, 11, 18, 21, false);
 
 DEFINE_bool(
     spirv_texture_exp_adjust_specialization, true,
