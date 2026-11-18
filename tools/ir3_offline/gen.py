@@ -32,6 +32,7 @@ gpu/spirv_shader_translator_fetch.cc gpu/spirv_shader_translator_memexport.cc
 gpu/spirv_shader_translator_rb.cc gpu/spirv_builder.cc gpu/shader.cc
 gpu/shader_translator.cc gpu/shader_translator_disasm.cc gpu/ucode.cc
 gpu/xenos.cc gpu/registers.cc gpu/register_file.cc gpu/spirv_shader.cc
+gpu/spirv_nonfinite_analysis.cc
 base/logging.cc base/string_buffer.cc base/cvar.cc base/string.cc
 base/memory.cc base/memory_posix.cc base/filesystem.cc base/filesystem_posix.cc
 base/threading.cc base/threading_posix.cc base/threading_timer_queue.cc
