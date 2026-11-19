@@ -147,7 +147,7 @@ object SettingsSchema {
         SettingsCategory("HID", listOf(
             l("HID", "hid", "HID backend", "android",
                 "android" to "android", "nop" to "nop"),
-            l("HID", "jit_frame_start", "Just-in-time frame start", "2",
+            l("HID", "jit_frame_start", "Just-in-time frame start", "0",
                 "0" to "Off", "1" to "Always on", "2" to "Auto (-20 ms latency)"),
         )),
 

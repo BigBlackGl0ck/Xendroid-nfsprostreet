@@ -13,6 +13,7 @@
 #include <chrono>
 #include <thread>
 
+#include "xe_jit_frame_start.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/frame_stats.h"
 #include "xenia/base/logging.h"
@@ -21,13 +22,14 @@
 #include "xenia/ui/vulkan/zerofg_config.h"
 
 DEFINE_int32(
-    jit_frame_start, 2,
+    jit_frame_start, 0,
     "Hold the guest's first controller state poll after each VdSwap so input "
     "is sampled just in time before the command processor needs the next frame "
     "(-15 to -20 ms input latency at 30 FPS with zero FPS drop). "
-    "0 = Off, 1 = Conservative (10 ms margin), 2 = Auto (6 ms margin). "
+    "0 = Off (default), 1 = Conservative (10 ms margin), 2 = Auto (6 ms margin). "
     "Automatically bypassed while Frame Generation paces presentation.",
     "HID");
+UPDATE_from_int32(jit_frame_start, 2026, 11, 19, 18, 2);
 
 namespace xe {
 namespace hid {
@@ -142,43 +144,14 @@ void AndroidInputDriver::HoldForJitFrameStart() {
   const uint64_t prev_work_start_ns =
       jit_last_work_start_ns_.load(std::memory_order_relaxed);
 
-  // Asymmetric slack controller (XDroid360 9b41ad8d2):
-  // - Instant backoff when slack falls below safety margin (6 ms in auto mode,
-  //   10 ms in conservative mode) followed by an 8-frame calm hold.
-  // - Gradual +1/8th slew up to 20 ms max hold when spare slack persists.
-  const int64_t margin_us = (mode == 1) ? 10000 : 6000;
-  const int64_t max_hold_us = (mode == 1) ? 12000 : 20000;
-  int64_t delay_us =
-      static_cast<int64_t>(jit_delay_us_.load(std::memory_order_relaxed));
-
-  if (swap_ns > prev_swap_ns && prev_swap_ns != 0 &&
-      swap_ns > prev_work_start_ns && prev_work_start_ns != 0) {
-    const int64_t period_us = static_cast<int64_t>((swap_ns - prev_swap_ns) / 1000);
-    const int64_t active_work_us =
-        static_cast<int64_t>((swap_ns - prev_work_start_ns) / 1000);
-
-    // Only pace steady 20..90 Hz gameplay cadences; reset immediately across
-    // loading stalls (>100 ms) or uncapped >120 FPS menus (<8 ms).
-    if (period_us < 8000 || period_us > 100000) {
-      delay_us = 0;
-      jit_calm_frames_.store(8, std::memory_order_relaxed);
-    } else {
-      const int64_t remaining_slack_us = period_us - active_work_us - delay_us;
-      uint32_t calm = jit_calm_frames_.load(std::memory_order_relaxed);
-      if (remaining_slack_us < margin_us) {
-        delay_us -= (margin_us - remaining_slack_us);
-        calm = 8;
-      } else if (calm > 0) {
-        --calm;
-      } else {
-        delay_us += std::min<int64_t>((remaining_slack_us - margin_us) / 8, 1000);
-      }
-      jit_calm_frames_.store(calm, std::memory_order_relaxed);
-    }
-    delay_us = std::clamp<int64_t>(delay_us, 0, max_hold_us);
-    jit_delay_us_.store(static_cast<uint32_t>(delay_us),
-                        std::memory_order_relaxed);
-  }
+  uint32_t calm = jit_calm_frames_.load(std::memory_order_relaxed);
+  int64_t delay_us = ComputeJitFrameStartDelayUs(
+      mode, swap_ns, prev_swap_ns, prev_work_start_ns,
+      static_cast<int64_t>(jit_delay_us_.load(std::memory_order_relaxed)),
+      calm);
+  jit_calm_frames_.store(calm, std::memory_order_relaxed);
+  jit_delay_us_.store(static_cast<uint32_t>(delay_us),
+                      std::memory_order_relaxed);
 
   if (delay_us >= 200) {
     std::this_thread::sleep_for(std::chrono::microseconds(delay_us));

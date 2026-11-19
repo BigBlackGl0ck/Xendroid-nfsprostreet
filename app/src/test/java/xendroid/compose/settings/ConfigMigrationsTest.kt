@@ -8,6 +8,7 @@ import org.junit.Test
 import xendroid.compose.settings.ConfigMigrations.Update
 
 class ConfigMigrationsTest {
+    private val jitFrameStart = Update(2026111918, "HID", "jit_frame_start", "int", "2", "0")
     private val immediate = Update(2026111801, "Vulkan", "vulkan_allow_present_mode_immediate", "bool", "true", "false")
     private val mailbox = Update(2026100712, "Vulkan", "vulkan_allow_present_mode_mailbox", "bool", "true", "false")
     private val leaf = Update(2026100512, "CPU", "inline_leaf_max_instructions", "int", "16", "32")
@@ -92,5 +93,16 @@ class ConfigMigrationsTest {
         assertNull(ConfigMigrations.plan(listOf(mailbox, immediate), file(
             "Config|defaults_date" to "2026111801",
             "Vulkan|vulkan_allow_present_mode_immediate" to "true")))
+    }
+
+    @Test fun jitFrameStartDefaultMigrationDisablesOldAutoDefaultOnce() {
+        val plan = ConfigMigrations.plan(listOf(immediate, jitFrameStart), file(
+            "Config|defaults_date" to "2026111823",
+            "HID|jit_frame_start" to "2"))!!
+        assertEquals(listOf(jitFrameStart), plan.writes)
+        assertEquals(2026111918L, plan.date)
+        assertNull(ConfigMigrations.plan(listOf(immediate, jitFrameStart), file(
+            "Config|defaults_date" to "2026111918",
+            "HID|jit_frame_start" to "2")))
     }
 }
