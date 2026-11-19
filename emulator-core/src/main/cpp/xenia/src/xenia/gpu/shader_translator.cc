@@ -975,6 +975,7 @@ bool ShaderTranslator::TranslateAnalyzedShader(
   assert_true(shader.is_ucode_analyzed());
   if (!shader.is_ucode_analyzed()) {
     XELOGE("AnalyzeUcode must be done on the shader before translation");
+    translation.PublishTranslation(false);
     return false;
   }
   translation_ = &translation;
@@ -1047,6 +1048,7 @@ bool ShaderTranslator::TranslateAnalyzedShader(
   // Publish last: creation threads take is_translated() as the binary, the
   // validity and (after PostTranslation) the shader's bindings being complete.
   translation.is_translated_.store(true, std::memory_order_release);
+  translation.is_translated_.notify_all();
   return is_valid;
 }
 

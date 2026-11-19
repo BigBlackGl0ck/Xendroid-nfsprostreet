@@ -831,6 +831,13 @@ class Shader {
       return !translation_claimed_.test_and_set(std::memory_order_acq_rel);
     }
 
+    // Blocks until the claiming thread publishes the translation result (#123).
+    void WaitForTranslation() const {
+      while (!is_translated_.load(std::memory_order_acquire)) {
+        is_translated_.wait(false, std::memory_order_acquire);
+      }
+    }
+
     // Errors that occurred during translation.
     const std::vector<Error>& errors() const { return errors_; }
 
@@ -871,6 +878,12 @@ class Shader {
    private:
     friend class Shader;
     friend class ShaderTranslator;
+
+    void PublishTranslation(bool valid) {
+      is_valid_.store(valid, std::memory_order_relaxed);
+      is_translated_.store(true, std::memory_order_release);
+      is_translated_.notify_all();
+    }
 
     Shader& shader_;
     uint64_t modification_;
