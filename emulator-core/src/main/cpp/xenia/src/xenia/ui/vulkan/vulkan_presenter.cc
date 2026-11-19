@@ -127,6 +127,17 @@ DEFINE_bool(
     "may present with tearing if frames don't meet the host display refresh "
     "rate.",
     "Vulkan");
+DEFINE_bool(
+    vulkan_swapchain_pretransform, false,
+    "Match VkSwapchainCreateInfoKHR::preTransform to the surface's "
+    "currentTransform on Android/WSI so SurfaceFlinger can scan out directly "
+    "without compositor rotation when pre-rotated.",
+    "Vulkan");
+DEFINE_bool(
+    vulkan_swapchain_hdr_scrgb, false,
+    "Prefer R16G16B16A16_SFLOAT with VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT "
+    "(scRGB HDR / wide gamut) when supported by the Vulkan surface.",
+    "Vulkan");
 DEFINE_bool(zerofg_frame_generation, false,
             "Enable the independent ZeroFG presenter.", "Vulkan");
 DEFINE_string(zerofg_mode, "off", "ZeroFG: off, zero (RC7), reallyzero (the dense flow).", "Vulkan");
@@ -1246,6 +1257,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
     // A's swapchain exists again: A owns the Surface (handback complete).
     zerofg_independent_presenter_->NoteMainSurfaceProducedByA();
   }
+  RequestGpuPowerControl("surface_connect");
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
   if (zerofg_independent_presenter_ &&
       zerofg_bound_selection_.load(std::memory_order_acquire) != ZeroFGSelection::kOff &&
@@ -1298,6 +1310,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
 }
 
 void VulkanPresenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
+  ReleaseGpuPowerControl("surface_disconnect");
   ResetColorFilter();
   ResetFrameGeneration();
   xe::RequestFrameTelemetryReset();
@@ -1495,14 +1508,51 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     return VK_NULL_HANDLE;
   }
 
-  // TODO(Triang3l): Support transforms.
-  if (!(surface_capabilities.supportedTransforms &
-        (VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR |
-         VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR))) {
+  VkSurfaceTransformFlagBitsKHR pre_transform =
+      VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  if (cvars::vulkan_swapchain_pretransform &&
+      (surface_capabilities.supportedTransforms &
+       surface_capabilities.currentTransform)) {
+    pre_transform = surface_capabilities.currentTransform;
+  } else if (surface_capabilities.supportedTransforms &
+             VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+    pre_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  } else if (surface_capabilities.supportedTransforms &
+             VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR) {
+    pre_transform = VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR;
+  } else if (surface_capabilities.supportedTransforms &
+             surface_capabilities.currentTransform) {
+    pre_transform = surface_capabilities.currentTransform;
+  } else {
     XELOGE(
-        "VulkanPresenter: The surface doesn't support identity or "
-        "window-system-controlled transform");
+        "VulkanPresenter: The surface doesn't support identity, inherit, or "
+        "currentTransform");
     return VK_NULL_HANDLE;
+  }
+  if (pre_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+      pre_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR ||
+      pre_transform == VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR ||
+      pre_transform ==
+          VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR) {
+    // Per Vulkan VUID-VkSwapchainCreateInfoKHR-imageExtent-01274, when matching
+    // a 90/270-degree currentTransform on Android, swapchain imageExtent is in
+    // pre-rotated physical panel coordinates.
+    if (surface_capabilities.currentExtent.width != UINT32_MAX &&
+        surface_capabilities.currentExtent.height != UINT32_MAX) {
+      image_extent = surface_capabilities.currentExtent;
+    } else {
+      std::swap(image_extent.width, image_extent.height);
+    }
+    image_extent.width =
+        std::min(std::max(image_extent.width,
+                          surface_capabilities.minImageExtent.width),
+                 std::min(max_framebuffer_extent.width,
+                          surface_capabilities.maxImageExtent.width));
+    image_extent.height =
+        std::min(std::max(image_extent.height,
+                          surface_capabilities.minImageExtent.height),
+                 std::min(max_framebuffer_extent.height,
+                          surface_capabilities.maxImageExtent.height));
   }
 
   // Get the surface format.
@@ -1549,6 +1599,18 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     image_format.format = kFormat8888Primary;
     image_format.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
   } else {
+    // Optional scRGB HDR / wide-gamut swapchain selection (xenia-edge 203b9bb92).
+    auto scrgb_hdr_it = surface_formats.cend();
+    if (cvars::vulkan_swapchain_hdr_scrgb) {
+      for (auto it = surface_formats.cbegin(); it != surface_formats.cend();
+           ++it) {
+        if (it->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+            it->colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
+          scrgb_hdr_it = it;
+          break;
+        }
+      }
+    }
     // Pick the sRGB 8888 format preferred by the OS, fall back to any sRGB
     // 8888, then to 8888 with an unknown color space, and then to the first
     // sRGB available, and then to the first.
@@ -1580,7 +1642,9 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
         preferred_8888_it = it;
       }
     }
-    if (format_8888_primary_it != surface_formats.cend() &&
+    if (scrgb_hdr_it != surface_formats.cend()) {
+      image_format = *scrgb_hdr_it;
+    } else if (format_8888_primary_it != surface_formats.cend() &&
         format_8888_secondary_it != surface_formats.cend()) {
       // Both the primary and the secondary 8888 formats are available - prefer
       // sRGB, if both are sRGB or not, prefer the primary format.
@@ -1687,11 +1751,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     swapchain_create_info.queueFamilyIndexCount = 0;
     swapchain_create_info.pQueueFamilyIndices = nullptr;
   }
-  swapchain_create_info.preTransform =
-      (surface_capabilities.supportedTransforms &
-       VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
-          ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
-          : VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR;
+  swapchain_create_info.preTransform = pre_transform;
   // Prefer opaque to avoid blending in the window system, or let that be
   // specified via the window system if it can't be forced. As a last resort,
   // just pick any - guest output will write alpha of 1 anyway.

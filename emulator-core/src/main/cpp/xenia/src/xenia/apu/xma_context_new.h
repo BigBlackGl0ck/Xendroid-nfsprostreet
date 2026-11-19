@@ -220,4 +220,4 @@ class XmaContextNew : public XmaContext {
 }  // namespace apu
 }  // namespace xe
 
-#endif  // XENIA_APU_XMA_CONTEXT_H_
+#endif  // XENIA_APU_XMA_CONTEXT_NEW_H_

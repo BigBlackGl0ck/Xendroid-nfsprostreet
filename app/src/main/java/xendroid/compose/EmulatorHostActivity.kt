@@ -38,7 +38,9 @@ import xendroid.compose.core.GyroCamera
 import xendroid.compose.core.refreshChoices
 import xendroid.compose.core.selectRefresh
 import xendroid.compose.core.sustainedPerformance
+import xendroid.compose.core.DualScreenDashboard
 import xendroid.compose.core.ExternalGameDisplay
+import xendroid.compose.core.GlitchRecorder
 import xendroid.compose.core.PresenterPerformanceHints
 import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
@@ -270,6 +272,19 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 onEvent = { message -> mainHandler.post { recordEvent("companion", message) } })
         },
         onChange = { mainHandler.post { refreshPhoneControllers() } },
+        newBluetoothHost = {
+            xendroid.compose.companion.CompanionHost(
+                streamServer = xendroid.compose.companion.CompanionBluetooth.openServer(applicationContext),
+                claimSlot = { key, _ ->
+                    controllerSlots.connectRemote(key)?.also { session.setSlotConnected(it, true, "BT Phone P${it + 1}") }
+                },
+                releaseSlot = { key, slot ->
+                    if (controllerSlots.disconnect(key) != null) session.setSlotConnected(slot, false, "BT Phone P${slot + 1}")
+                },
+                onInput = { slot, change -> session.keyEventSlot(slot, change.key, change.pressed, change.value) },
+                onEvent = { message -> mainHandler.post { recordEvent("companion", message) } },
+            )
+        },
     )
     /** Null until the first refresh (resources are not ready while the activity is constructed). */
     private val phoneControllersLabel = mutableStateOf<String?>(null)
@@ -352,6 +367,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var surfaceView: SurfaceView? = null
     private var surfaceAvailable = false
     private var externalDisplay: ExternalGameDisplay? = null
+    private var dualScreenDashboard: DualScreenDashboard? = null
+    private val glitchRecorder = GlitchRecorder()
+    private val glitchChord = GlitchRecorder.ChordDetector()
     /** Null until the TV output reports (it starts on the phone). */
     private val externalDisplayLabel = mutableStateOf<String?>(null)
     /** 15h: the TV margin (overscan), percent of the screen per side. */
@@ -535,6 +553,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private fun saveControlOptions(change: (xendroid.compose.gamepad.ControlOptions) -> xendroid.compose.gamepad.ControlOptions) {
         lifecycleScope.launch {
             runCatching { controlOptions.update(change) }.onFailure { Log.w(TAG, "Saving the control options failed", it) }
+        }
+    }
+    private val btConnectPermLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        // Whether granted or denied, attempt starting phoneControllers (if denied, Status.Failed explains why).
+        if (phoneControllers.host == null && activeTitleState.value != null) {
+            phoneControllers.toggle()
+            refreshPhoneControllers()
         }
     }
     private val lsfgCache = mutableStateOf<String?>(null)
@@ -1447,8 +1472,12 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             if (started) session.detachSurface()
         }, statusChanged = {
             externalDisplayLabel.value = it
-            gameOnExternalDisplay.value = externalDisplay?.activeDisplay != null
+            val extId = externalDisplay?.activeDisplay?.displayId
+            gameOnExternalDisplay.value = extId != null
+            dualScreenDashboard?.setGameOutputDisplay(extId)
         })
+        dualScreenDashboard = runCatching { DualScreenDashboard(this) }.getOrNull()
+        dualScreenDashboard?.setGameOutputDisplay(externalDisplay?.activeDisplay?.displayId)
         tvMargin.floatValue = getSharedPreferences(DISPLAY_SETTINGS_PREFS, MODE_PRIVATE).getFloat("tv_margin_percent", 0f)
             .coerceIn(0f, xendroid.compose.core.TvMargin.MAX)
         externalDisplay?.setMargin(tvMargin.floatValue)
@@ -1659,6 +1688,11 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                                             maybeVibrate()
                                         }
                                         if (kc in KC_RTHUMB_LEFT..KC_RTHUMB_DOWN) touchStickHeld[kc] = pressed
+                                        if (menuState.value.developer &&
+                                            glitchChord.onGuestKey(kc, pressed, SystemClock.elapsedRealtime())
+                                        ) {
+                                            captureGlitchSnapshot()
+                                        }
 
                                         session.keyEvent(
                                             kc,
@@ -1712,9 +1746,11 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                                         if (phones) runCatching { phoneControllers.tick(playing, guest) }
                                         val state = if (controllerRumble) guest else null
                                         if (state == null) stopRumble() else runCatching { driveRumble(state) }
-
+                                        if (playing && menuState.value.developer && glitchChord.poll(SystemClock.elapsedRealtime())) {
+                                            captureGlitchSnapshot()
+                                        }
                                         // #123: suspend completely (0 Hz) when touch-only, menu-idle, or backgrounded without companion phones.
-                                        val needFastTick = kbHeld || heldDirection != 0 || menuAdjustHeld || phones || (playing && controllerRumble)
+                                        val needFastTick = kbHeld || heldDirection != 0 || menuAdjustHeld || phones || (playing && controllerRumble) || (playing && menuState.value.developer)
                                         if (needFastTick) {
                                             delay(50)
                                         } else {
@@ -1878,6 +1914,43 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                                                 "${burst.amount} of ${burst.events} blocks concealed, ${burst.seconds} s with underruns")
                                             null -> {}
                                         }
+                                    }
+                                    val audioStatsNow = session.audioRunStats()
+                                    val curFps = session.averageFps()
+                                    val curFrameMs = session.lastFrameTimeMs()
+                                    if (runningNow) {
+                                        glitchRecorder.record(
+                                            GlitchRecorder.Sample(
+                                                elapsedMs = android.os.SystemClock.elapsedRealtime() - createdAtMs,
+                                                guestFps = curFps,
+                                                frameMs = curFrameMs,
+                                                presentCount = session.hostPresentSubmissionCount(),
+                                                audioConcealedBlocks = audioStatsNow?.getOrNull(2) ?: 0L,
+                                                pipelinesCompiled = compileStats?.getOrNull(0) ?: 0L,
+                                                thermalStatus = lastThermalStatus,
+                                                zeroFgActive = zeroFgActive.value,
+                                            )
+                                        )
+                                    }
+                                    dualScreenDashboard?.let { dash ->
+                                        val batC = xendroid.compose.sessions.SessionRuns.batteryCelsius(applicationContext) ?: 0f
+                                        val padPct = readControllerBatteryPercent()
+                                        val recentFeed = runEvents.snapshot().events.takeLast(5).map { xendroid.compose.sessions.describeEvent(it) }
+                                        dash.update(
+                                            DualScreenDashboard.DashboardSnapshot(
+                                                gameName = loadingName ?: activeTitle ?: "XenDroid+",
+                                                titleId = activeTitle,
+                                                driverLabel = session.activeDriverIdentity()?.label,
+                                                fps = curFps,
+                                                frameMs = curFrameMs,
+                                                playedSeconds = (android.os.SystemClock.elapsedRealtime() - createdAtMs) / 1000L,
+                                                pipelinesCompiled = compileStats?.getOrNull(0) ?: 0L,
+                                                audioConcealed = audioStatsNow?.getOrNull(2) ?: 0L,
+                                                batteryCelsius = batC,
+                                                controllerBatteryPercent = padPct,
+                                                recentEvents = recentFeed,
+                                            )
+                                        )
                                     }
                                     if (menuState.value.open) menuStatus.value = buildMenuStatus()
                                     // 15n: the performance panel, built only while it is on screen.
@@ -2378,6 +2451,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         performanceHints.close()
         gyroCamera.stop()
         stopEventSources()
+        glitchChord.reset()
+        dualScreenDashboard?.close()
+        dualScreenDashboard = null
         externalDisplay?.close()
         // The process dies below: tell the phones now (bounded wait, sockets off this thread).
         phoneControllers.close(timeoutMs = 300)
@@ -2532,6 +2608,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
 
         if (event.repeatCount == 0) {
             sentGuestKeys[identity] = gameKey
+            if (menuState.value.developer && glitchChord.onGuestKey(gameKey, true, SystemClock.elapsedRealtime())) {
+                captureGlitchSnapshot()
+            }
             session.keyEvent(
                 gameKey,
                 true,
@@ -2566,6 +2645,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (player > 0 && slotInput.keyUp(player, identity)) return true
 
         sentGuestKeys.remove(identity)?.let { gameKey ->
+            glitchChord.onGuestKey(gameKey, false, SystemClock.elapsedRealtime())
             session.keyEvent(gameKey, false, KEY_VALUE_UNUSED)
             return true
         }
@@ -3171,6 +3251,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 HudMetric.POWER -> stringResource(R.string.menu_chip_power)
                 HudMetric.BATTERY_LEVEL -> stringResource(R.string.menu_chip_charge)
                 HudMetric.BATTERY_TIME -> stringResource(R.string.menu_chip_battery_time)
+                HudMetric.CONTROLLER_BATTERY -> stringResource(R.string.menu_chip_controller_battery)
                 HudMetric.HOST_SUBMISSIONS -> "Vulkan"
                 else -> metric.label
             }
@@ -3377,6 +3458,19 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 // The native driver takes player slots only once the emulator runs a title.
                 if (phoneControllers.host == null && activeTitleState.value == null) {
                     Toast.makeText(this, getString(R.string.host_phone_wait), Toast.LENGTH_SHORT).show()
+                    return
+                }
+                // On Android 12+ (SDK >= 31), Bluetooth RFCOMM fallback needs runtime BLUETOOTH_CONNECT when no LAN is up.
+                if (phoneControllers.host == null &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    !xendroid.compose.companion.CompanionBluetooth.hasConnectPermission(this) &&
+                    runCatching {
+                        xendroid.compose.companion.CompanionNetwork.choose(
+                            xendroid.compose.companion.CompanionNetwork.candidates()
+                        )
+                    }.getOrNull() == null
+                ) {
+                    btConnectPermLauncher.launch(android.Manifest.permission.BLUETOOTH_CONNECT)
                     return
                 }
                 phoneControllers.toggle()
@@ -3836,8 +3930,32 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     /** The HUD's chips in the menu: its metrics, then the FPS graph (null), then (developer) Vulkan submissions. */
     private fun hudChipMetrics(): List<HudMetric?> = listOf(HudMetric.CPU, HudMetric.GPU, HudMetric.RAM, HudMetric.GPU_MEMORY,
-        HudMetric.BATTERY_TEMPERATURE, HudMetric.SOC_TEMPERATURE, HudMetric.POWER, HudMetric.BATTERY_LEVEL, HudMetric.BATTERY_TIME, null) +
+        HudMetric.BATTERY_TEMPERATURE, HudMetric.SOC_TEMPERATURE, HudMetric.POWER, HudMetric.BATTERY_LEVEL, HudMetric.BATTERY_TIME,
+        HudMetric.CONTROLLER_BATTERY, null) +
         if (menuState.value.developer) listOf(HudMetric.HOST_SUBMISSIONS) else emptyList()
+
+    private fun captureGlitchSnapshot() {
+        val snap = glitchRecorder.snapshot()
+        val tid = activeTitleState.value
+        val name = loadingName
+        val gpu = session.activeGpuLabel()
+        val nowEpoch = System.currentTimeMillis()
+        recordEvent("glitch", "6s diagnostic snapshot captured (${snap.size} samples)", flush = true)
+        maybeVibrate()
+        Toast.makeText(this, getString(R.string.host_glitch_saved), Toast.LENGTH_SHORT).show()
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching {
+                GlitchRecorder.writeSnapshot(
+                    dir = java.io.File(filesDir, "glitch_reports"),
+                    titleId = tid,
+                    gameName = name,
+                    gpuLabel = gpu,
+                    capturedAtEpochMs = nowEpoch,
+                    samples = snap,
+                )
+            }.onFailure { Log.w(TAG, "Writing 6s glitch snapshot failed", it) }
+        }
+    }
 
     private fun toggleHudChip(index: Int) {
         val chips = hudChipMetrics()

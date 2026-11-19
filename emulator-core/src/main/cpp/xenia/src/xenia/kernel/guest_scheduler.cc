@@ -1395,7 +1395,7 @@ void GuestScheduler::WakeAll() {
   // most one backoff interval.
   bool any_blocked = false;
   for (int i = 0; i < kMaxCpus; ++i) {
-    if (cpus_[i].has_blocked.load()) {
+    if (cpus_[i].has_blocked.load(std::memory_order_seq_cst)) {
       any_blocked = true;
       break;
     }
@@ -1437,7 +1437,7 @@ void GuestScheduler::WakeForSignal(const XObject* object) {
   }
   bool any_blocked = false;
   for (int i = 0; i < kMaxCpus; ++i) {
-    if (cpus_[i].has_blocked.load()) {
+    if (cpus_[i].has_blocked.load(std::memory_order_seq_cst)) {
       any_blocked = true;
       break;
     }
@@ -1550,6 +1550,12 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
   }
   {
     std::lock_guard<std::mutex> lock(lock_);
+    // Dekker store-before-load: publish has_blocked with seq_cst BEFORE reading
+    // the wait epoch so a concurrent signaler doing epoch.fetch_add(seq_cst)
+    // followed by has_blocked.load(seq_cst) cannot both see has_blocked==false
+    // while we see the pre-signal epoch (eliminating 64ms backstop lost wakes).
+    Cpu& cpu = cpus_[cpu_index];
+    cpu.has_blocked.store(true, std::memory_order_seq_cst);
     // A signal between the caller's failed poll and this park bumped the epoch
     // but walked the blocked list before we joined it, so nothing would re-poll
     // us before the backstop. Compare under the walk's own lock and poke this
@@ -1566,7 +1572,7 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
         epoch_gated = true;
       }
       if (epoch_gated && epoch_now != wait_epoch) {
-        cpus_[cpu_index].repoll_now.store(true, std::memory_order_relaxed);
+        cpu.repoll_now.store(true, std::memory_order_relaxed);
       }
     }
     auto& links = self->scheduler_links();
@@ -1583,7 +1589,6 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
     links.wait_deadline_ms = deadline_ms;
     // A wait consumes the slice.
     links.quantum_deadline_tick = 0;
-    Cpu& cpu = cpus_[cpu_index];
     LinkTailLocked(cpu.blocked_head, cpu.blocked_tail, self);
     int prio = ClampPriority(self->priority());
     if (prio > cpu.max_blocked_prio) {
@@ -1601,9 +1606,6 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
     if (due && due < cpu.next_timed_repoll_ms) {
       cpu.next_timed_repoll_ms = due;
     }
-    // seq_cst pairs with the wake pre-filters' loads: epoch-read-then-store
-    // here vs bump-then-load there, so at least one side always sees the other.
-    cpu.has_blocked.store(true);
   }
   self->guest_object<X_KTHREAD>()->thread_state = KTHREAD_STATE_WAITING;
   YieldToScheduler();
@@ -1713,19 +1715,9 @@ void GuestScheduler::RereadyBlocked(int cpu_index, bool poked) {
           t = next;
           continue;
         }
-      }
-      // Only the backstop reached this waiter, on a pass no wake poked, yet
-      // its gate's epoch moved: the signal's own wake never re-readied it.
-      if (force_all && !poked && links.wait_gated) {
-        XObject* obj = t->cooperative_wait_object();
-        bool epoch_moved = false;
-        if (obj) {
-          epoch_moved = obj->cooperative_signal_epoch() != links.wait_epoch;
-        } else if (links.wait_gate_count) {
-          epoch_moved =
-              t->cooperative_wait_set_epoch() != links.wait_epoch;
-        }
-        if (epoch_moved &&
+        // Only the backstop reached this waiter, on a pass no wake poked, yet
+        // its gate's epoch moved: the signal's own wake never re-readied it.
+        if (force_all && !poked && may_have_resolved &&
             !(links.wait_deadline_ms && now_ms >= links.wait_deadline_ms)) {
           ++rescued;
           backstop_rescue_tid_ = t->thread_id();

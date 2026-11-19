@@ -2163,6 +2163,23 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
             depth_clear_start_tiles_wrapped - color_clear_start_tiles_wrapped);
   }
 
+  // A 4x surface drawn as 1x at double size (vulkan_msaa_4x_as_2x2) covers the
+  // same EDRAM tiles with one pixel per sample: clear that key, with the
+  // rectangle in samples, instead of moving the range to a 4x image for the
+  // clear and back for the next draw (Reach: ~187 MB of transfers per frame).
+  // The pitch in tiles stays; the tile range above is the same.
+  if (msaa_4x_clears_as_2x2_ && msaa_samples == xenos::MsaaSamples::k4X &&
+      !IsDrawResolutionScaled() &&
+      pitch_pixels * 2 <= std::min(max_render_target_width,
+                                   xenos::kTexture2DCubeMaxWidthHeight)) {
+    msaa_samples = xenos::MsaaSamples::k1X;
+    clear_rectangle.x_pixels <<= 1;
+    clear_rectangle.y_pixels <<= 1;
+    clear_rectangle.width_pixels <<= 1;
+    clear_rectangle.height_pixels <<= 1;
+    scale_native = IsScaleNativeForPitch(pitch_tiles_at_32bpp, msaa_samples);
+  }
+
   RenderTargetKey depth_render_target_key;
   RenderTarget* depth_render_target = nullptr;
   if (depth_clear_length_tiles) {

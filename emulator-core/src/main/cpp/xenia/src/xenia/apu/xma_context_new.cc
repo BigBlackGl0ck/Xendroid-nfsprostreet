@@ -7,12 +7,21 @@
 ******************************************************************************
 */
 
-#include <atomic>
-
 #include "xenia/apu/xma_context_new.h"
-#include "xenia/apu/xma_helpers.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+
+#if XE_ARCH_ARM64 || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#include "xenia/apu/xma_helpers.h"
+#include "xenia/base/byte_order.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/math.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 
@@ -34,6 +43,77 @@ extern "C" {
 
 namespace xe {
 namespace apu {
+
+namespace {
+
+// Fast vectorized float32 -> big-endian PCM int16 frame conversion for XMA2
+// (2x-unrolled ARM NEON with round-to-nearest-even + saturation + vrev16q_u8).
+inline void ConvertXmaFrameFloatToBe16(const uint8_t* const* samples,
+                                       bool is_two_channel,
+                                       uint8_t* output_buffer) {
+  constexpr float kScale = 32767.0f;
+#if XE_ARCH_ARM64 || defined(__ARM_NEON)
+  const auto* ch0 = reinterpret_cast<const float*>(samples[0]);
+  const float32x4_t zero_v = vdupq_n_f32(0.0f);
+  const float32x4_t neg_one_v = vdupq_n_f32(-1.0f);
+  const float32x4_t pos_one_v = vdupq_n_f32(1.0f);
+  const float32x4_t scale_v = vdupq_n_f32(kScale);
+
+  auto cvt_i32 = [&](float32x4_t f) -> int32x4_t {
+    const float32x4_t finite_or_inf = vbslq_f32(vceqq_f32(f, f), f, zero_v);
+    const float32x4_t clamped =
+        vminq_f32(vmaxq_f32(finite_or_inf, neg_one_v), pos_one_v);
+    return vcvtnq_s32_f32(vmulq_f32(clamped, scale_v));
+  };
+
+  if (is_two_channel && samples[1] != nullptr) {
+    const auto* ch1 = reinterpret_cast<const float*>(samples[1]);
+    for (uint32_t i = 0; i < XmaContext::kSamplesPerFrame; i += 8) {
+      const int16x4_t l0 = vqmovn_s32(cvt_i32(vld1q_f32(ch0 + i)));
+      const int16x4_t r0 = vqmovn_s32(cvt_i32(vld1q_f32(ch1 + i)));
+      const int16x4_t l1 = vqmovn_s32(cvt_i32(vld1q_f32(ch0 + i + 4)));
+      const int16x4_t r1 = vqmovn_s32(cvt_i32(vld1q_f32(ch1 + i + 4)));
+
+      const int16x4x2_t z0 = vzip_s16(l0, r0);
+      const int16x4x2_t z1 = vzip_s16(l1, r1);
+      const uint8x16_t b0 =
+          vrev16q_u8(vreinterpretq_u8_s16(vcombine_s16(z0.val[0], z0.val[1])));
+      const uint8x16_t b1 =
+          vrev16q_u8(vreinterpretq_u8_s16(vcombine_s16(z1.val[0], z1.val[1])));
+      vst1q_u8(output_buffer + (i * 4), b0);
+      vst1q_u8(output_buffer + (i * 4) + 16, b1);
+    }
+  } else {
+    for (uint32_t i = 0; i < XmaContext::kSamplesPerFrame; i += 16) {
+      const int16x4_t s0 = vqmovn_s32(cvt_i32(vld1q_f32(ch0 + i)));
+      const int16x4_t s1 = vqmovn_s32(cvt_i32(vld1q_f32(ch0 + i + 4)));
+      const int16x4_t s2 = vqmovn_s32(cvt_i32(vld1q_f32(ch0 + i + 8)));
+      const int16x4_t s3 = vqmovn_s32(cvt_i32(vld1q_f32(ch0 + i + 12)));
+
+      const uint8x16_t b0 =
+          vrev16q_u8(vreinterpretq_u8_s16(vcombine_s16(s0, s1)));
+      const uint8x16_t b1 =
+          vrev16q_u8(vreinterpretq_u8_s16(vcombine_s16(s2, s3)));
+      vst1q_u8(output_buffer + (i * 2), b0);
+      vst1q_u8(output_buffer + (i * 2) + 16, b1);
+    }
+  }
+#else
+  auto* out = reinterpret_cast<int16_t*>(output_buffer);
+  const bool interleave_two = is_two_channel && samples[1] != nullptr;
+  uint32_t o = 0;
+  for (uint32_t i = 0; i < XmaContext::kSamplesPerFrame; ++i) {
+    for (uint32_t ch = 0; ch <= uint32_t(interleave_two); ++ch) {
+      const auto* in = reinterpret_cast<const float*>(samples[ch]);
+      const float sample = std::isnan(in[i]) ? 0.0f : in[i];
+      const float scaled = xe::clamp_float(sample, -1.0f, 1.0f) * kScale;
+      out[o++] = xe::byte_swap(static_cast<int16_t>(std::lrintf(scaled)));
+    }
+  }
+#endif
+}
+
+}  // namespace
 
 XmaContextNew::XmaContextNew() = default;
 
@@ -116,9 +196,7 @@ RingBuffer XmaContextNew::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
   return output_rb;
 }
 
-// Why a serviced kick produced no samples. A context that keeps bailing here
-// leaves its output buffer untouched, so the guest mixes whatever was already
-// there - which is what "complete static" sounds like.
+// Why a serviced kick produced no samples.
 std::atomic<uint64_t> g_xma_bail_no_output_buffer{0};
 std::atomic<uint64_t> g_xma_bail_consume_empty{0};
 std::atomic<uint64_t> g_xma_bail_no_space{0};
@@ -191,8 +269,8 @@ bool XmaContextNew::Work() {
   // A pass only starts when there is room for it.
   if (static_cast<int32_t>(GetPassBlocks(&data)) >
       remaining_subframe_blocks_in_output_buffer_) {
-    XELOGD("XmaContext {}: No space for subframe decoding {}/{}!", id(),
-           GetPassBlocks(&data), remaining_subframe_blocks_in_output_buffer_);
+    XELOGAPU("XmaContext {}: No space for subframe decoding {}/{}!", id(),
+             GetPassBlocks(&data), remaining_subframe_blocks_in_output_buffer_);
     g_xma_bail_no_space.fetch_add(1, std::memory_order_relaxed);
     SetError(&data, kErrorOutputSpace);
     StoreContextMerged(data, initial_data, context_ptr);
@@ -200,6 +278,7 @@ bool XmaContextNew::Work() {
   }
 
   g_xma_decoded.fetch_add(1, std::memory_order_relaxed);
+
   // Frames left in the pass being written. A pass only starts when there is
   // room for all of it, and ends early where the advance says.
   uint32_t pass_frames = 0;
@@ -237,12 +316,7 @@ bool XmaContextNew::Work() {
       pass_frames = 0;
     }
 
-    // Don't abandon a partially consumed frame. Consume() hands over at most
-    // subframe_decode_count blocks per pass so the pass that exhausts the
-    // input typically leaves the rest of the frame undelivered. Work() has
-    // already cleared is_enabled_ and only XMAEnableContext sets it again.
-    // Game polling for the remainder therefore never kicks and nothing
-    // else can ever deliver it so keep draining until the frame is out.
+    // Don't abandon a partially consumed frame.
     if ((!data.IsAnyInputBufferValid() || decode_stop_ != kDecodeStop::kNone) &&
         current_frame_remaining_subframes_ == 0) {
       XELOGAPU("XmaContext {}: Work loop exit - buffers_valid={} stop={}", id(),
@@ -322,6 +396,8 @@ void XmaContextNew::ClearLocked(XMA_CONTEXT_DATA* data) {
   data->output_buffer_write_offset = 0;
 
   current_frame_remaining_subframes_ = 0;
+  current_frame_end_block_ = 0;
+  frame_skipped_ = false;
   advance_ = {};
   FlushDecoder();
 }
@@ -369,7 +445,7 @@ void XmaContextNew::Consume(RingBuffer* XE_RESTRICT output_rb,
   }
 
   // Guard against subframe_decode_count == 0 which would cause zero progress
-  // and an infinite loop in Work().  Treat 0 as 1 (minimum progress).
+  // and an infinite loop in Work(). Treat 0 as 1 (minimum progress).
   const uint8_t effective_sdc =
       std::max(static_cast<uint32_t>(1), data->subframe_decode_count);
   // A pass writes whole subframes, two blocks each in stereo.
@@ -473,8 +549,7 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
   const uint8_t skip_count = xma::GetPacketSkipCount(packet);
 
   // Full packet skip — no new frames begin in this packet (XMA2: 0xFF,
-  // XMA1: lower 8 bits of 0x7FF also reads as 0xFF).  Advance to the
-  // next sequential packet instead of trying to parse frames.
+  // XMA1: lower 8 bits of 0x7FF also reads as 0xFF).
   if (skip_count == 0xFF) {
     XELOGAPU("XmaContext {}: Full packet skip (0xFF) at packet {}/{}", id(),
              packet_index, current_input_packet_count);
@@ -523,10 +598,7 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
     return;
   }
 
-  // Zero the scratch buffer only once we're actually going to assemble a
-  // frame in it — the early-out paths above (invalid packet index, full
-  // packet skip) run at the Work() polling rate and were paying this 4 KiB
-  // fill for nothing (~2% of total CPU).
+  // Zero the scratch buffer only once we're actually going to assemble a frame.
   input_buffer_.fill(0);
 
   // Frame header split across packet boundary — combine packets to read
@@ -634,9 +706,9 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
   if (result == kPacketResult::kFrame) {
     data->parser_error_status = 0;
     data->parser_error_set = 0;
-    // dump_raw(av_frame_, id());
-    ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data),
-                 bool(data->is_stereo), raw_frame_.data());
+    ConvertXmaFrameFloatToBe16(
+        reinterpret_cast<const uint8_t* const*>(av_frame_->data),
+        bool(data->is_stereo), raw_frame_.data());
     // Output runs from the decode position's subframe to the end of the
     // frame, or to loop_subframe_end on a loop end frame. A position of 4 or
     // more skips the frame.
@@ -751,7 +823,7 @@ void XmaContextNew::WritePosition(XMA_CONTEXT_DATA* data) {
   held_buffer_ = data->current_buffer;
 }
 
-//  Frame & Packet searching methods
+// Frame & Packet searching methods
 
 void XmaContextNew::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
   if (data->loop_count == 0) {
@@ -818,7 +890,6 @@ kPacketHandle XmaContextNew::GetPacketHandle(
   const uint32_t next_buffer_address =
       data->GetInputBufferAddress(buffer_index);
   if (!next_buffer_address) {
-    // This should never occur but there is always a chance
     XELOGE(
         "XmaContext {}: the packet is expected to be in the {} buffer, "
         "but the buffer marked valid is null pointer!",
@@ -947,10 +1018,6 @@ const kPacketInfo XmaContextNew::GetPacketInfo(uint8_t* packet,
 
   while (true) {
     if (stream.BitsRemaining() < kBitsPerFrameHeader) {
-      // This frame's 15-bit header runs into the next packet, so its size
-      // isn't readable yet. Count it anyway, or the caller takes the previous
-      // frame for the packet's last and skips straight past this one. Size 0
-      // sends it to the split-header path.
       if (stream.BitsRemaining() > 0) {
         consider_frame(static_cast<uint32_t>(stream.offset_bits()), 0);
         packet_info.frame_count_++;
@@ -984,10 +1051,7 @@ const kPacketInfo XmaContextNew::GetPacketInfo(uint8_t* packet,
   if (xma::IsPacketXma2Type(packet)) {
     const uint8_t xma2_frame_count = xma::GetPacketFrameCount(packet);
     if (xma2_frame_count > packet_info.frame_count_) {
-      // Frame header split across packet boundary — scanner couldn't
-      // peek the full 15-bit header. Trust the XMA2 header count.
       if (packet_info.current_frame_size_ == 0) {
-        // Current frame is the split-header frame
         packet_info.current_frame_ = packet_info.frame_count_;
       }
       packet_info.frame_count_ = xma2_frame_count;
@@ -1021,15 +1085,12 @@ int16_t XmaContextNew::GetPacketNumber(size_t size, size_t bit_offset) {
 int XmaContextNew::PrepareDecoder(int sample_rate, bool is_two_channel) {
   sample_rate = GetSampleRate(sample_rate);
 
-  // Re-initialize the context with new sample rate and channels.
   uint32_t channels = is_two_channel ? 2 : 1;
   if (av_context_->sample_rate != sample_rate ||
       av_context_->ch_layout.nb_channels != (int)channels) {
     XELOGAPU("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}",
              id(), av_context_->sample_rate, sample_rate,
              av_context_->ch_layout.nb_channels, channels);
-    // We have to recreate the codec context so it'll realloc whatever data it
-    // needs.
     avcodec_free_context(&av_context_);
     av_context_ = avcodec_alloc_context3(av_codec_);
 
@@ -1074,7 +1135,6 @@ kPacketResult XmaContextNew::DecodePacket(AVCodecContext* av_context,
   ret = avcodec_receive_frame(av_context, av_frame);
 
   if (ret == AVERROR(EAGAIN)) {
-    // Codec needs more input before producing output (e.g. first frame warmup).
     return kPacketResult::kNoFrame;
   }
   if (ret < 0) {
@@ -1102,16 +1162,11 @@ void XmaContextNew::StopOnParserError(XMA_CONTEXT_DATA* data, uint32_t status) {
 void XmaContextNew::StoreContextMerged(const XMA_CONTEXT_DATA& data,
                                        const XMA_CONTEXT_DATA& initial_data,
                                        uint8_t* context_ptr) {
-  // The guest mixer polls output_buffer_write_offset from another thread and
-  // then reads the PCM behind it. Publish the ring writes before the offset:
-  // without this, weakly ordered CPUs can expose the new offset ahead of the
-  // samples and the game mixes stale data. x86 never shows this (TSO).
   std::atomic_thread_fence(std::memory_order_release);
 
   XMA_CONTEXT_DATA fresh(context_ptr);
 
   // DWORD 0: decoder owns loop_count, output_buffer_write_offset.
-  // Only clear valid flags the decoder actually consumed (was 1, now 0).
   fresh.loop_count = data.loop_count;
   fresh.output_buffer_write_offset = data.output_buffer_write_offset;
   if (initial_data.input_buffer_0_valid && !data.input_buffer_0_valid) {
@@ -1128,12 +1183,12 @@ void XmaContextNew::StoreContextMerged(const XMA_CONTEXT_DATA& data,
     fresh.output_buffer_valid = 0;
   }
 
-  // DWORD 2: decoder owns input_buffer_read_offset, error_status
+  // DWORD 2: decoder owns input_buffer_read_offset, error_status, error_set
   fresh.input_buffer_read_offset = data.input_buffer_read_offset;
   fresh.error_status = data.error_status;
   fresh.error_set = data.error_set;
 
-  // DWORD 3: decoder owns parser_error_status
+  // DWORD 3: decoder owns parser_error_status, parser_error_set
   fresh.parser_error_status = data.parser_error_status;
   fresh.parser_error_set = data.parser_error_set;
 

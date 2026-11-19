@@ -22,6 +22,7 @@
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
@@ -104,6 +105,12 @@ KernelState::~KernelState() {
   for (auto& dpcs : processor_dpcs_) {
     dpcs.thread.reset();
     dpcs.event.reset();
+  }
+
+  // Stop System Link before modules and the object table are torn down under
+  // the global critical region.
+  if (auto xam = GetKernelModule<xam::XamModule>("xam.xex")) {
+    xam->ShutdownSystemLink();
   }
 
   executable_module_.reset();
@@ -843,11 +850,16 @@ X_RESULT KernelState::ApplyTitleUpdate(
     return X_STATUS_SUCCESS;
   }
 
+  // A module loaded after the executable takes the update it took, if any.
+  if (GetExecutableModule() && !content_manager()->IsRootTaken("UPDATE")) {
+    return X_STATUS_SUCCESS;
+  }
+
   const xam::XCONTENT_AGGREGATE_DATA* selected_update = &title_updates.front();
   // A module loaded later, such as a DLL, finds UPDATE mounted with the
   // update chosen for the executable. Probing closes UPDATE after each
   // candidate, which would take it from under the files the title has open.
-  if (title_updates.size() > 1 && !content_manager()->IsRootOpen("UPDATE")) {
+  if (title_updates.size() > 1 && !content_manager()->IsRootTaken("UPDATE")) {
     selected_update = SelectTitleUpdate(title_updates, title_module);
   }
 
@@ -856,8 +868,27 @@ X_RESULT KernelState::ApplyTitleUpdate(
     return X_STATUS_SUCCESS;
   }
 
+  auto recover_launch_module = [&]() -> X_RESULT {
+    // At launch (!GetExecutableModule()), recover the main executable in-place
+    // without the update so PrepareLaunch continues with the clean base XEX.
+    if (GetExecutableModule()) {
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    const std::string original_path = title_module->path();
+    XELOGE("Failed to apply title update, starting {} without it",
+           original_path);
+    title_module->Unload();
+    content_manager()->CloseContent("UPDATE");
+    const X_STATUS reload_status = title_module->LoadFromFile(original_path);
+    if (XFAILED(reload_status)) {
+      return reload_status;
+    }
+    return X_STATUS_SUCCESS;
+  };
+
   if (!patch_module->xex_module()->is_patch()) {
-    return X_STATUS_UNSUCCESSFUL;
+    content_manager()->CloseContent("UPDATE");
+    return GetExecutableModule() ? X_STATUS_UNSUCCESSFUL : X_STATUS_SUCCESS;
   }
 
   if (!IsPatchSignatureProper(title_module, patch_module)) {
@@ -865,6 +896,7 @@ X_RESULT KernelState::ApplyTitleUpdate(
       XELOGW(
           "Skipping incompatible title update for {} due to signature mismatch",
           title_module->name());
+      content_manager()->CloseContent("UPDATE");
       return X_STATUS_SUCCESS;
     }
 
@@ -881,7 +913,11 @@ X_RESULT KernelState::ApplyTitleUpdate(
     }
   }
 
-  return ApplyTitleUpdate(title_module, patch_module);
+  const X_RESULT patch_status = ApplyTitleUpdate(title_module, patch_module);
+  if (XFAILED(patch_status)) {
+    return recover_launch_module();
+  }
+  return patch_status;
 }
 
 std::vector<xam::XCONTENT_AGGREGATE_DATA> KernelState::FindTitleUpdate(
@@ -1679,7 +1715,8 @@ bool KernelState::QueueProcessorDpc(uint8_t cpu, uint32_t dpc_ptr,
     }
     dpcs.queue.push_back({dpc_ptr, arg1, arg2});
   }
-  // Only the guest's copy, the runner takes the arguments from the queue.
+  // Only the guest's copy; the runner takes the arguments from the host queue
+  // so dpcs.lock is never held across a guest memory access.
   auto dpc = memory()->TranslateVirtual<XDPC*>(dpc_ptr);
   dpc->arg1 = arg1;
   dpc->arg2 = arg2;

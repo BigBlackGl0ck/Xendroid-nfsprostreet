@@ -16,21 +16,21 @@ class SettingsSchemaTest {
     // 146 before the redesign, plus the 29 cvars of the core it shows now (docs/ui-redesign/README.md),
     // less APU|mute and GPU|readback_memexport, which the core never defined (ajustes-2.md).
     // Display|host_present_from_non_ui_thread is intentionally absent (forced true natively).
-    // Plus adds Vulkan|zerofg_mode, in its own ZeroFG section, and System link's Network|systemlink and
-    // Network|systemlink_peers: 176.
-    @Test fun total_entry_count_is_176() {
-        assertEquals(176, all.size)
+    // Plus adds Vulkan|zerofg_mode, System link's Network|systemlink + Network|systemlink_peers (176),
+    // and the 19 Plus Ultra Track A/B/C/D canonical engine cvars: 195.
+    @Test fun total_entry_count_is_195() {
+        assertEquals(195, all.size)
         assertEquals(
-            176,
+            195,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action } + all.count { it is Setting.Text },
         )
     }
 
     @Test fun counts_by_type_match_verified_inventory() {
-        assertEquals(120, all.count { it is Setting.Bool })        // 103 + 18 new - 2 the core never had + systemlink
+        assertEquals(138, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra bool cvars
         assertEquals(20, all.count { it is Setting.IntRange })     // 14 + 6 new
-        assertEquals(31, all.count { it is Setting.ListChoice })   // 27 + 3 new + zerofg_mode
+        assertEquals(32, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start
         assertEquals(2, all.count { it is Setting.Action })
         assertEquals(3, all.count { it is Setting.Text })          // launch_module, cl, systemlink_peers
     }
