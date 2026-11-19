@@ -43,6 +43,14 @@ class FrameGenerationTargetTest {
         assertFalse(FrameGenerationTarget.plan(120, 120f, 60)!!.lowBase)
     }
 
+    @Test fun twentyFpsLimitPlansCleanlyAt60Hz() {
+        assertEquals(
+            Plan(60, 3, 20, limitedByDisplay = false, belowTarget = false),
+            FrameGenerationTarget.plan(60, 60f, 20),
+        )
+        assertTrue(FrameGenerationTarget.plan(60, 60f, 20)!!.lowBase)
+    }
+
     @Test fun offIsTheMultiplier() {
         assertNull(FrameGenerationTarget.plan(FrameGenerationTarget.OFF, 120f, 60))
         assertNull(FrameGenerationTarget.plan(120, 0f, 60))

@@ -35,7 +35,7 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
     arch=(-mssse3)
 fi
 flags=(-std=c++20 -O1 -Wall "${arch[@]}" -I "$cpp" -I "$cpp/xenia" -I "$cpp/xenia/src" -I "$test/stubs")
-for name in presentation_runtime_test pipeline_cache_file_test vblank_pacer_test changed_settings_test frame_stats_test audio_buffer_tuner_test audio_block_renderer_test xex_header_test fatx_package_name_test socket_option_test xnet_startup_test structured_jumps_test draw_export_tracker_test gpu_compat_perf_test xam_live_signin_test; do
+for name in presentation_runtime_test pipeline_cache_file_test vblank_pacer_test changed_settings_test frame_stats_test audio_buffer_tuner_test audio_block_renderer_test xex_header_test fatx_package_name_test socket_option_test xnet_startup_test structured_jumps_test draw_export_tracker_test gpu_compat_perf_test xam_live_signin_test jit_frame_start_test; do
     "${cxx[@]}" "${flags[@]}" "$test/$name.cc" -o "$build/$name"
 done
 # C01: the crash record is a source file of its own (signal-handler code).
@@ -56,12 +56,15 @@ done
 "$build/draw_export_tracker_test"
 "$build/gpu_compat_perf_test"
 "$build/xam_live_signin_test"
+"$build/jit_frame_start_test"
 "$build/crash_record_test" "$build/crash-record-scratch"
 "$build/string_key_test"
 "${cxx[@]}" "${flags[@]}" "$test/lote16_upstream_test.cc" \
     "$cpp/xenia/src/xenia/base/string.cc" \
     "$cpp/xenia/src/xenia/base/utf8.cc" -o "$build/lote16_upstream_test"
 "$build/lote16_upstream_test" "$cpp/xenia/src/xenia/cpu/backend/a64"
+"${cxx[@]}" "${flags[@]}" -pthread "$test/shader_translation_wait_test.cc" -o "$build/shader_translation_wait_test"
+"$build/shader_translation_wait_test" "$cpp/xenia/src/xenia"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then

@@ -1850,9 +1850,7 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(
     if (use_try_claim) {
       should_translate = translation.TryClaimTranslation();
       if (!should_translate) {
-        while (!translation.is_translated()) {
-          xe::threading::MaybeYield();
-        }
+        translation.WaitForTranslation();
       }
     }
     if (should_translate) {
