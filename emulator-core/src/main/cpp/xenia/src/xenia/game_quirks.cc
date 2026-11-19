@@ -528,6 +528,10 @@ static const Quirk kQuirks[] = {
      "garbled character select and intro"},
     // FIFA 16: stadium shadow mask readback requires fast resolve copy to RAM.
     {0x454109EE, "readback_resolve", "fast", "half of the pitch black"},
+    // FIFA Street (2012): indoor pitch surfaces render with green/black colors
+    // unless all resolves are copied back to guest RAM (#114).
+    {0x4541097B, "readback_resolve", "all",
+     "indoor pitch surface renders with green/black colors without full readback"},
     // Naruto: Rise of a Ninja: its worker thread 0x18 starts (8265BB68) by
     // calling the routine at +0xEC of its object. When it ran on its
     // creator's CPU right after its creation, the object held the thread's id
