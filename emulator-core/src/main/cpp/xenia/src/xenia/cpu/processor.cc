@@ -43,6 +43,79 @@
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #endif
 
+#include <cstdio>
+#include <mutex>
+#include <string>
+#include <sys/stat.h>
+
+DEFINE_bool(recomp_log_functions, true,
+            "Log every guest function the JIT compiles (static recomp helper).",
+            "CPU");
+DEFINE_string(recomp_log_dir, "/sdcard/Xendroid-recomp",
+              "Folder for static recomp helper logs.", "CPU");
+
+namespace {
+
+std::mutex g_recomp_log_mutex;
+FILE* g_recomp_log_file = nullptr;
+bool g_recomp_log_gave_up = false;
+
+void RecompMakeDirs(const std::string& path) {
+  for (size_t i = 1; i <= path.size(); ++i) {
+    if (i == path.size() || path[i] == '/') {
+      mkdir(path.substr(0, i).c_str(), 0777);
+    }
+  }
+}
+
+FILE* RecompOpenLog() {
+  const std::string candidates[] = {
+      cvars::recomp_log_dir,
+      "/sdcard/Android/data/xendroid.compose.debug/files/recomp",
+      "/sdcard/Android/data/xendroid.compose/files/recomp",
+  };
+  for (const auto& dir : candidates) {
+    if (dir.empty()) continue;
+    RecompMakeDirs(dir);
+    std::string path = dir + "/functions.log";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (f) {
+      XELOGI("Recomp log: writing functions to {}", path);
+      std::fprintf(f, "# ---- new session ----\n");
+      std::fflush(f);
+      return f;
+    }
+  }
+  XELOGE("Recomp log: could not open any log folder");
+  return nullptr;
+}
+
+void RecompLogFunction(xe::cpu::Function* function) {
+  if (!cvars::recomp_log_functions || !function) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_recomp_log_mutex);
+  if (!g_recomp_log_file) {
+    if (g_recomp_log_gave_up) {
+      return;
+    }
+    g_recomp_log_file = RecompOpenLog();
+    if (!g_recomp_log_file) {
+      g_recomp_log_gave_up = true;
+      return;
+    }
+  }
+  const char* module_name = "?";
+  if (function->module()) {
+    module_name = function->module()->name().c_str();
+  }
+  std::fprintf(g_recomp_log_file, "%08X %08X %s\n",
+               static_cast<unsigned>(function->address()),
+               static_cast<unsigned>(function->end_address()), module_name);
+  std::fflush(g_recomp_log_file);
+}
+
+}  // namespace
 #if 0 && DEBUG
 #define DEFAULT_DEBUG_FLAG true
 #else
