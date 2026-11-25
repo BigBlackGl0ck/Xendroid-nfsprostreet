@@ -995,7 +995,8 @@ uint8_t* Processor::AllocateFunctionTraceData(size_t size) {
   return functions_trace_file_->Allocate(size);
 }
 
-void Processor::OnFunctionDefined(Function* function) {
+void Processor::OnFunctionDefined(Function* function) {  
+RecompLogFunction(function);
   auto global_lock = global_critical_region_.Acquire();
   for (auto breakpoint : breakpoints_) {
     if (breakpoint->address_type() == Breakpoint::AddressType::kGuest) {
